@@ -1,0 +1,12 @@
+# Your contact data stays on your machine
+*.xlsx
+*.csv
+!examples/*.csv
+*.status.json
+*.status.json.tmp
+failures/
+logs/
+
+.venv/
+__pycache__/
+.pytest_cache/
