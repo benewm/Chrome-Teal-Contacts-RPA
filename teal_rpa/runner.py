@@ -151,6 +151,7 @@ class Run:
                     say("    From LinkedIn: " + ", ".join(f"{ASKABLE_FIELDS[f]} {v}" for f, v in found.items()))
                 else:
                     say(f"    LinkedIn: {info.note or 'nothing found'}")
+                    self.save_linkedin_evidence(contact, info)
                 if not self.options.dry_run:
                     self.state.remember(key, linkedin_checked=True)
 
@@ -175,6 +176,24 @@ class Run:
             except SpreadsheetLockedError as exc:
                 say(f"    Note: {exc} (Kept in {self.state.path.name}; it'll still be used.)")
         return values
+
+    def save_linkedin_evidence(self, contact: Contact, info) -> None:
+        """Keep what LinkedIn showed when nothing was found, to check for misses."""
+        try:
+            self.failures_dir.mkdir(parents=True, exist_ok=True)
+            base = self.failures_dir / f"linkedin-row-{contact.row_number}"
+            base.with_suffix(".txt").write_text(
+                f"{contact.name}\n{contact.url}\n{info.note or ''}\n\n"
+                f"--- Contact info box text ---\n{info.dialog_text or '(none)'}\n",
+                encoding="utf-8")
+            # Chrome only draws the tab in front, so switch to it briefly.
+            self.linkedin.page.bring_to_front()
+            self.linkedin.page.screenshot(path=str(base.with_suffix(".png")), timeout=10_000)
+            log.info("Row %s: LinkedIn evidence saved to %s.*", contact.row_number, base)
+        except Exception as exc:  # evidence is best effort
+            log.warning("Row %s: couldn't save LinkedIn evidence: %s", contact.row_number, exc)
+        finally:
+            self.teal.page.bring_to_front()
 
     def lookup_linkedin(self, contact: Contact):
         """LinkedIn Contact info for this contact, or None if it couldn't be read.

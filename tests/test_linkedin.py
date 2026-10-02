@@ -42,3 +42,8 @@ def test_contact_info_url():
         "https://www.linkedin.com/in/benewm/overlay/contact-info/"
     assert contact_info_url("https://www.linkedin.com/in/benewm", "http://127.0.0.1:9") == \
         "http://127.0.0.1:9/in/benewm/overlay/contact-info/"
+
+
+def test_email_anywhere_in_box_when_heading_differs():
+    text = "Contact info\nJosh's Profile\nlinkedin.com/in/joshreicher\nEmail address\njosh@example.com"
+    assert parse_contact_info(text).email == "josh@example.com"

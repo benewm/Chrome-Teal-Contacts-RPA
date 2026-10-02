@@ -39,11 +39,11 @@ git --version
 
 ### 2. Get the code from GitHub
 
-This downloads the project into `Documents\Chrome-Teal-Contacts-RPA`. Git
+This downloads the project into `C:\Users\benew\Chrome-Teal-Contacts-RPA`. Git
 remembers where it came from, so later updates are one command (`git pull`).
 
 ```powershell
-cd $HOME\Documents
+cd $HOME
 git clone https://github.com/benewm/Chrome-Teal-Contacts-RPA.git
 cd Chrome-Teal-Contacts-RPA
 git checkout claude/linkedin-contacts-rpa-a0108k
@@ -51,7 +51,7 @@ git checkout claude/linkedin-contacts-rpa-a0108k
 
 If GitHub asks you to sign in, a browser window opens; sign in as usual.
 
-To get the latest version later: `cd $HOME\Documents\Chrome-Teal-Contacts-RPA`
+To get the latest version later: `cd C:\Users\benew\Chrome-Teal-Contacts-RPA`
 then `git pull`.
 
 ### 3. Install the tool's Python packages
@@ -72,7 +72,7 @@ You don't need `playwright install`: the tool uses your normal Google Chrome.
 **Every time you open a new PowerShell to use the tool**, first run:
 
 ```powershell
-cd $HOME\Documents\Chrome-Teal-Contacts-RPA
+cd C:\Users\benew\Chrome-Teal-Contacts-RPA
 .venv\Scripts\Activate.ps1
 ```
 
@@ -98,13 +98,13 @@ Shift + right-click the file, **Copy as path**, then paste).
 
 ```powershell
 # See what would happen; doesn't open Chrome
-python teal_contacts.py "C:\Users\Ben\Documents\contacts.xlsx" --check
+python teal_contacts.py "C:\Users\benew\OneDrive\AI Projects\Chrome Teal Contact RPA\Uploads\Upload 1.xlsx" --check
 
 # First real try: one contact
-python teal_contacts.py "C:\Users\Ben\Documents\contacts.xlsx" --limit 1
+python teal_contacts.py "C:\Users\benew\OneDrive\AI Projects\Chrome Teal Contact RPA\Uploads\Upload 1.xlsx" --limit 1
 
 # Everything that's left, reviewing each before it saves
-python teal_contacts.py "C:\Users\Ben\Documents\contacts.xlsx"
+python teal_contacts.py "C:\Users\benew\OneDrive\AI Projects\Chrome Teal Contact RPA\Uploads\Upload 1.xlsx"
 ```
 
 At the review pause: **Enter** saves, **s** skips this contact (it's retried next
@@ -183,9 +183,11 @@ Chrome windows and run again. Your normal Chrome windows are fine to leave open.
 **"LinkedIn wants you to sign in"**: sign in to LinkedIn in the tool's Chrome
 window and press Enter in the terminal.
 
-**"LinkedIn: no email or phone shared on LinkedIn"**: normal; the person hasn't
-shared them with you. The contact is still created. Use `--ask-missing` to type
-them in yourself.
+**"LinkedIn: no email or phone shared on LinkedIn"**: usually normal; the person
+hasn't shared them with you. The contact is still created. Use `--ask-missing` to
+type them in yourself. If you know they do share an email, look at
+`failures\linkedin-row-<N>.txt` and `.png`: they show exactly what the tool saw in
+LinkedIn's Contact info box.
 
 **"LinkedIn's Contact info box didn't appear"**: LinkedIn was slow, showed a
 security check, or changed its page. The contact is still created without

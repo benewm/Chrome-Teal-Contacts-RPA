@@ -37,6 +37,7 @@ class ContactInfo:
     email: str = ""
     phone: str = ""
     note: str | None = None  # why nothing was found, if known
+    dialog_text: str = ""    # what the Contact info box showed, for troubleshooting
 
 
 def contact_info_url(profile_url: str, origin: str = LINKEDIN_ORIGIN) -> str:
@@ -66,6 +67,12 @@ def parse_contact_info(text: str, mailto_href: str | None = None) -> ContactInfo
             if match:
                 email = match.group(0)
                 break
+    if not email:
+        # Heading worded differently? The box only holds contact details, so
+        # anything shaped like an email address in it is theirs.
+        match = EMAIL_RE.search(text)
+        if match:
+            email = match.group(0)
 
     phone = ""
     for line in after("Phone"):
@@ -125,6 +132,7 @@ class LinkedInPage:
             raise LinkedInError(f"Couldn't read LinkedIn's Contact info: {_short(exc)}") from exc
 
         info = parse_contact_info(text, href)
+        info.dialog_text = text
         if not (info.email or info.phone):
             info.note = "no email or phone shared on LinkedIn"
         return info

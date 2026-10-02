@@ -382,6 +382,9 @@ def test_linkedin_missing_profile_still_creates_contact(tmp_path, fresh):
 
     assert len(summary.done) == 1
     assert site.saved[0]["email"] == ""
+    evidence = (tmp_path / "failures" / "linkedin-row-2.txt").read_text()
+    assert "doesn't exist" in evidence
+    assert (tmp_path / "failures" / "linkedin-row-2.png").exists()
 
 
 def test_linkedin_sign_in_prompt(tmp_path, fresh):
