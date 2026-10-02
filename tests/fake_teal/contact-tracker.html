@@ -1,0 +1,39 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Contact Tracker | Teal (test stand-in)</title>
+<style>
+  #modal { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: none; }
+  #modal.open { display: block; }
+  #modal iframe { width: 480px; height: 780px; margin: 20px auto; display: block; border: 0; background: #fff; }
+</style></head>
+<body>
+  <h1>Contacts</h1>
+  <!-- Mirrors Teal's markup: an svg icon plus text inside the button -->
+  <button id="add" class="inline-flex" data-active="false">
+    <svg aria-hidden="true" width="16" height="16"><path d="M5 12h14"></path></svg>Add a New Contact</button>
+  <ul id="contacts"></ul>
+  <!-- A decoy iframe, like a chat widget -->
+  <iframe src="/widget.html" title="Chat" style="width:200px;height:60px"></iframe>
+  <div id="modal"></div>
+<script>
+  const slow = new URLSearchParams(location.search).get("slow");
+  document.getElementById("add").addEventListener("click", () => {
+    setTimeout(() => {
+      const modal = document.getElementById("modal");
+      modal.innerHTML = '<iframe src="/form.html" title="Add Contact"></iframe>';
+      modal.classList.add("open");
+    }, slow ? 1500 : 100);
+  });
+  window.addEventListener("message", (e) => {
+    if (e.data && e.data.type === "contact-saved") {
+      const li = document.createElement("li");
+      li.textContent = e.data.name;
+      document.getElementById("contacts").appendChild(li);
+    }
+    if (e.data && (e.data.type === "contact-saved" || e.data.type === "cancel")) {
+      const modal = document.getElementById("modal");
+      modal.classList.remove("open");
+      modal.innerHTML = "";
+    }
+  });
+</script>
+</body></html>

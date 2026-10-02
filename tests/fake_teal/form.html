@@ -1,0 +1,37 @@
+<!doctype html>
+<html><head><meta charset="utf-8"></head>
+<body>
+  <button aria-label="Close" onclick="parent.postMessage({type:'cancel'}, '*')">×</button>
+  <h2>Add a New Contact</h2>
+  <form id="f">
+    <label>First Name</label><input name="first_name" placeholder="First Name">
+    <label>Last Name</label><input name="last_name" placeholder="Last Name">
+    <label>Job Title</label><input name="title" placeholder="Job Title">
+    <label>Company Name</label><input name="company" placeholder="Company Name">
+    <label>Email</label><input name="email" placeholder="Email Address">
+    <label>LinkedIn</label><input name="url" placeholder="LinkedIn Profile">
+    <label>Twitter</label><input name="twitter" placeholder="Twitter Handle URL">
+    <label>Location</label><input name="location" placeholder="Location">
+    <label>Phone Number</label><input name="phone" placeholder="Phone">
+    <div id="error"></div>
+    <button type="button" onclick="parent.postMessage({type:'cancel'}, '*')">Cancel</button>
+    <button type="submit">Save Contact</button>
+  </form>
+<script>
+  const phone = document.querySelector("input[name=phone]");
+  phone.addEventListener("input", () => {
+    const d = phone.value.replace(/\D/g, "");
+    if (d.length === 10) phone.value = `(${d.slice(0,3)}) ${d.slice(3,6)}-${d.slice(6)}`;
+  });
+  document.getElementById("f").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const data = Object.fromEntries(new FormData(e.target));
+    if (data.email.includes("invalid")) {
+      document.getElementById("error").innerHTML = '<p role="alert">Please enter a valid email</p>';
+      return;
+    }
+    await fetch("/api/contacts", {method: "POST", body: JSON.stringify(data)});
+    parent.postMessage({type: "contact-saved", name: data.first_name + " " + data.last_name}, "*");
+  });
+</script>
+</body></html>

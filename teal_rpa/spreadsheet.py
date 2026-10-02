@@ -20,9 +20,11 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     "company": ["Company", "Company Name"],
     "email": ["Email", "Email Address", "E-mail"],
     "phone": ["Phone", "Phone Number", "Mobile"],
+    "location": ["Location"],
+    "twitter": ["Twitter", "twitter_handle", "Twitter Handle"],
 }
 REQUIRED_FIELDS = ["url", "first_name", "last_name", "title", "company"]
-OPTIONAL_FIELDS = ["email", "phone"]
+OPTIONAL_FIELDS = ["email", "phone", "location", "twitter"]
 
 LINKEDIN_PROFILE_RE = re.compile(r"^https://www\.linkedin\.com/in/[^/]+$")
 
@@ -45,6 +47,8 @@ class Contact:
     company: str
     email: str
     phone: str
+    location: str = ""
+    twitter: str = ""
     raw: dict[str, str] = field(default_factory=dict)
     problems: list[str] = field(default_factory=list)
 
@@ -199,6 +203,8 @@ def load_contacts(path: str | Path, sheet_name: str | None = None) -> Sheet:
             company=get("company"),
             email=get("email"),
             phone=get("phone"),
+            location=get("location"),
+            twitter=get("twitter"),
             raw=raw,
         )
         if not url:

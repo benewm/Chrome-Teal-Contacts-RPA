@@ -59,6 +59,14 @@ class RunState:
         entry.update(extra)
         self.save()
 
+    def remember(self, key: str, **fields) -> None:
+        """Store extra per-contact data (e.g. a typed-in email) without changing status."""
+        self.entries.setdefault(key, {"status": PENDING}).update(fields)
+        self.save()
+
+    def recall(self, key: str, field: str, default=None):
+        return self.entries.get(key, {}).get(field, default)
+
     def reset(self) -> None:
         self.entries = {}
         if self.path.exists():
