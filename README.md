@@ -3,12 +3,16 @@
 Teal has no bulk import for contacts. This tool reads your spreadsheet and, for each
 row, opens Teal's **Contact Tracker** (`app.tealhq.com/contact-tracker`), clicks
 **+ Add a New Contact**, fills in the form from the spreadsheet and clicks
-**Save Contact**. The spreadsheet is the source of truth; LinkedIn isn't visited.
+**Save Contact**. The spreadsheet is the source of truth.
 
 For each contact it:
 
-1. Asks you in the terminal for **Email** and **Phone** if those cells are blank
-   (press Enter to skip) and writes what you type back into the spreadsheet.
+1. If **Email** or **Phone** is blank in the spreadsheet, opens the person's
+   LinkedIn **Contact info** (`<profile>/overlay/contact-info/`) and uses the email
+   and phone shown there. What it finds is written back into the spreadsheet.
+   LinkedIn only shows these when the person shares them with you (mostly
+   1st-degree connections), so blanks are normal. With `--ask-missing` it then
+   asks you in the terminal for anything still blank (Enter skips).
 2. Fills First Name, Last Name, Job Title, Company Name, Email, LinkedIn, Phone
    (plus Location and Twitter if your sheet has them) and checks each value stuck.
 3. Pauses so you can look at the form in Chrome, then saves it when you press Enter.
@@ -74,7 +78,7 @@ cd $HOME\Documents\Chrome-Teal-Contacts-RPA
 
 (`(.venv)` at the start of the prompt means it's active.)
 
-### 4. Sign in to Teal in the tool's Chrome window (first run only)
+### 4. Sign in to Teal and LinkedIn in the tool's Chrome window (first run only)
 
 Chrome doesn't allow automation on your everyday profile (since Chrome 136), so the
 tool runs Chrome with its own profile folder:
@@ -82,8 +86,10 @@ tool runs Chrome with its own profile folder:
 
 The first time you run the tool, a new Chrome window opens on Teal's sign-in page
 and the terminal says so. Sign in to Teal there (Google sign-in works), then press
-Enter in the terminal. Chrome remembers the sign-in, so later runs go straight to
-work. You don't need the Teal extension in this profile.
+Enter in the terminal. The first time it needs LinkedIn, the same happens for
+LinkedIn: sign in to LinkedIn in that window, then press Enter. Chrome remembers both
+sign-ins, so later runs go straight to work. You don't need the Teal extension in
+this profile.
 
 ## Running it
 
@@ -106,7 +112,7 @@ run), **q** stops the run (this contact stays pending). You can also correct a
 field in Chrome before pressing Enter. **Ctrl+C** stops at any point.
 
 **Close the spreadsheet in Excel while the tool runs**, so it can write the
-emails/phones you type back into it. If it's open, the tool tells you and keeps
+emails/phones it finds (or you type) back into it. If it's open, the tool tells you and keeps
 the values in its progress file instead.
 
 | Option | What it does |
@@ -114,10 +120,12 @@ the values in its progress file instead.
 | `--check` | Validate the spreadsheet and list pending contacts; no browser |
 | `--limit N` | Process at most N pending contacts this run |
 | `--auto-save` | Save without the review pause |
+| `--no-linkedin` | Don't look up blank Email/Phone on LinkedIn |
+| `--ask-missing` | Ask in the terminal for Email/Phone still blank after LinkedIn |
 | `--dry-run` | Do everything except Save: fill each form, then click Cancel. Records nothing |
 | `--reset` | Forget all progress and start over (doesn't touch Teal) |
 | `--sheet NAME` | Use this worksheet instead of the first one |
-| `--delay SECONDS` | Pause between contacts (default 2, plus up to 50% random) |
+| `--delay SECONDS` | Pause between contacts (default 4, plus up to 50% random) |
 | `--retries N` | Retries when Teal's page or form doesn't load (default 2, with backoff) |
 | `--timeout SECONDS` | How long to wait for Teal's page and form (default 20) |
 | `--chrome-path PATH` | Location of `chrome.exe` if it isn't found automatically |
@@ -126,7 +134,8 @@ the values in its progress file instead.
 ### What it creates next to your spreadsheet
 
 - `contacts.xlsx.status.json`: progress (done / failed / skipped per contact, with
-  the reason, plus any email/phone you typed). Delete it, or use `--reset`, to
+  the reason, any email/phone found or typed, and whether LinkedIn was already
+  checked, so a retried row doesn't visit LinkedIn again). Delete it, or use `--reset`, to
   start over.
 - `logs\teal_contacts-<date>-<time>.log`: everything each run did.
 - `failures\row-<N>.png`: a screenshot of Chrome whenever a row fails.
@@ -146,8 +155,8 @@ layout works as-is. Headers are matched case-insensitively:
 | Last name | `Last Name` | yes |
 | Job title | `Position`, `Title`, `Job Title` | yes |
 | Company | `Company` | yes |
-| Email | `Email Address`, `Email` | no (asked for if blank) |
-| Phone | `Phone`, `Phone Number` | no (asked for if blank) |
+| Email | `Email Address`, `Email` | no (looked up on LinkedIn if blank) |
+| Phone | `Phone`, `Phone Number` | no (looked up on LinkedIn if blank) |
 | Location | `Location` | no |
 | Twitter | `twitter_handle`, `Twitter` | no |
 
@@ -170,6 +179,22 @@ the tool's Chrome window. Sign in there and press Enter in the terminal.
 **"Chrome started but didn't open its debugging port"**: a Chrome window using
 the tool's profile is open from before (e.g. you opened it yourself). Close those
 Chrome windows and run again. Your normal Chrome windows are fine to leave open.
+
+**"LinkedIn wants you to sign in"**: sign in to LinkedIn in the tool's Chrome
+window and press Enter in the terminal.
+
+**"LinkedIn: no email or phone shared on LinkedIn"**: normal; the person hasn't
+shared them with you. The contact is still created. Use `--ask-missing` to type
+them in yourself.
+
+**"LinkedIn's Contact info box didn't appear"**: LinkedIn was slow, showed a
+security check, or changed its page. The contact is still created without
+email/phone. If it happens every time, open one `.../overlay/contact-info/` link in
+the tool's Chrome window to see what LinkedIn shows.
+
+**Go easy on LinkedIn**: LinkedIn limits how many profiles you can view and may
+show security checks if you view many quickly. Keep runs to about 30-50 contacts
+(`--limit 40`) and keep the default delay.
 
 **"Couldn't find Google Chrome"**: pass `--chrome-path "C:\Program Files\Google\Chrome\Application\chrome.exe"`.
 
@@ -201,6 +226,6 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The end-to-end tests drive Chrome (headless) against a local stand-in of Teal's
-contact tracker in `tests/fake_teal/`. Set `TEAL_RPA_TEST_CHROME` to a Chrome or
+The end-to-end tests drive Chrome (headless) against local stand-ins of Teal's
+contact tracker (`tests/fake_teal/`) and LinkedIn's Contact info overlay. Set `TEAL_RPA_TEST_CHROME` to a Chrome or
 Chromium path if it isn't found automatically.

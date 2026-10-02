@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from .linkedin import LinkedInError, LinkedInLoginRequired, LinkedInPage
 from .spreadsheet import Contact, Sheet, SpreadsheetLockedError, write_back
 from .state import DONE, FAILED, SKIPPED, RunState
 from .teal import NotLoggedIn, SaveUnconfirmed, TealError, TealPage
@@ -27,6 +28,8 @@ class Options:
     delay: float = 2.0
     retries: int = 2
     backoff: float = 2.0
+    linkedin: bool = True       # look up blank Email/Phone on LinkedIn
+    ask_missing: bool = False   # prompt in the terminal for what's still blank
 
 
 @dataclass
@@ -94,10 +97,10 @@ class Prompter:
             if answer in ("q", "quit"):
                 return "quit"
 
-    def wait_for_login(self, reason: str) -> bool:
+    def wait_for_login(self, reason: str, site: str = "Teal") -> bool:
         print(f"\n  {reason}.")
         answer = self.input(
-            "  Sign in to Teal in the Chrome window the tool opened, then press Enter "
+            f"  Sign in to {site} in the Chrome window the tool opened, then press Enter "
             "(q to quit): "
         ).strip().lower()
         return answer not in ("q", "quit")
@@ -111,46 +114,85 @@ class Run:
     options: Options
     prompter: Prompter
     failures_dir: Path
+    linkedin: LinkedInPage | None = None
     sleep: Callable[[float], None] = time.sleep
 
     # -- one contact ----------------------------------------------------------
 
     def fill_missing(self, contact: Contact) -> dict[str, str]:
-        """Return the values to type into Teal, asking for blank Email/Phone."""
+        """Return the values to type into Teal.
+
+        Blank Email/Phone are filled from (in order) what an earlier run
+        found, LinkedIn's Contact info, and, with --ask-missing, the terminal.
+        """
         values = {
             "first_name": contact.first_name, "last_name": contact.last_name,
             "title": contact.title, "company": contact.company, "url": contact.url,
             "email": contact.email, "phone": contact.phone,
             "location": contact.location, "twitter": contact.twitter,
         }
-        typed: dict[str, str] = {}
+        key = contact.key
         for field in ASKABLE_FIELDS:
-            if values[field]:
-                continue
-            # Answered on an earlier run (e.g. the row failed afterwards)?
-            remembered = self.state.recall(contact.key, field)
-            if remembered:
-                values[field] = remembered
-                continue
-            if self.state.recall(contact.key, f"{field}_skipped"):
-                continue
-            value = self.prompter.ask_field(contact, field)
-            values[field] = value
-            if self.options.dry_run:
-                continue
-            if value:
-                typed[field] = value
-                self.state.remember(contact.key, **{field: value})
-            else:
-                self.state.remember(contact.key, **{f"{field}_skipped": True})
+            if not values[field]:
+                values[field] = self.state.recall(key, field) or ""
 
-        if typed:
+        def blanks():
+            return [f for f in ASKABLE_FIELDS if not values[f]]
+
+        found: dict[str, str] = {}
+        if blanks() and self.linkedin and self.options.linkedin \
+                and not self.state.recall(key, "linkedin_checked"):
+            info = self.lookup_linkedin(contact)
+            if info is not None:
+                for field in blanks():
+                    if getattr(info, field):
+                        values[field] = found[field] = getattr(info, field)
+                if found:
+                    say("    From LinkedIn: " + ", ".join(f"{ASKABLE_FIELDS[f]} {v}" for f, v in found.items()))
+                else:
+                    say(f"    LinkedIn: {info.note or 'nothing found'}")
+                if not self.options.dry_run:
+                    self.state.remember(key, linkedin_checked=True)
+
+        typed: dict[str, str] = {}
+        if self.options.ask_missing:
+            for field in blanks():
+                if self.state.recall(key, f"{field}_skipped"):
+                    continue
+                value = self.prompter.ask_field(contact, field)
+                values[field] = value
+                if value:
+                    typed[field] = value
+                elif not self.options.dry_run:
+                    self.state.remember(key, **{f"{field}_skipped": True})
+
+        new = {**found, **typed}
+        if new and not self.options.dry_run:
+            self.state.remember(key, **new)
             try:
-                write_back(self.sheet, contact.row_number, typed)
-                log.info("Row %s: wrote %s to the spreadsheet", contact.row_number, ", ".join(typed))
+                write_back(self.sheet, contact.row_number, new)
+                log.info("Row %s: wrote %s to the spreadsheet", contact.row_number, ", ".join(new))
             except SpreadsheetLockedError as exc:
                 say(f"    Note: {exc} (Kept in {self.state.path.name}; it'll still be used.)")
         return values
+
+    def lookup_linkedin(self, contact: Contact):
+        """LinkedIn Contact info for this contact, or None if it couldn't be read.
+
+        Problems here never fail the row; the contact is still created.
+        """
+        for _ in range(2):
+            try:
+                return self.linkedin.lookup(contact.url)
+            except LinkedInLoginRequired as exc:
+                if not self.prompter.wait_for_login(str(exc), site="LinkedIn"):
+                    raise UserQuit() from exc
+            except LinkedInError as exc:
+                say(f"    LinkedIn: {exc}; continuing without it.")
+                return None
+            finally:
+                self.teal.page.bring_to_front()
+        return None
 
     def process_row(self, contact: Contact) -> Outcome:
         values = self.fill_missing(contact)

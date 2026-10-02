@@ -124,7 +124,7 @@ class TealPage:
             if not actual.strip():
                 raise TealError(f"The '{placeholder}' box stayed empty after typing {value!r}")
             if actual != value:
-                notes.append(f"Teal shows {placeholder} as {actual!r} (spreadsheet: {value!r})")
+                notes.append(f"Teal shows {placeholder} as {actual!r} (typed: {value!r})")
         return notes
 
     def form_is_open(self, frame: Frame) -> bool:

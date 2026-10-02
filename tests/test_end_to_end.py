@@ -17,6 +17,7 @@ import pytest
 playwright_sync = pytest.importorskip("playwright.sync_api")
 
 from teal_rpa import browser  # noqa: E402
+from teal_rpa.linkedin import LinkedInPage  # noqa: E402
 from teal_rpa.runner import Options, Prompter, Run  # noqa: E402
 from teal_rpa.spreadsheet import load_contacts  # noqa: E402
 from teal_rpa.state import DONE, FAILED, SKIPPED, RunState  # noqa: E402
@@ -45,11 +46,58 @@ class FakeTeal:
     def __init__(self):
         self.saved = []
         self.logged_in = True
+        self.linkedin_logged_in = True
+        self.linkedin_visits = []
+        # slug -> (email, phone) shown in the LinkedIn Contact info overlay
+        self.linkedin_profiles = {
+            "edsoohoo": ("ed@lenovo.com", "203-555-0100"),
+            "phoneonly": ("", "+1 (212) 555-0199"),
+            "private": ("", ""),
+        }
+
+
+def linkedin_contact_info_html(slug, email, phone):
+    sections = [f"<section><h3>{slug.title()}&#39;s Profile</h3>"
+                f"<a href=\"https://linkedin.com/in/{slug}\">linkedin.com/in/{slug}</a></section>"]
+    if phone:
+        sections.append(f"<section><h3>Phone</h3><ul><li><span>{phone}</span> "
+                        f"<span>(Mobile)</span></li></ul></section>")
+    sections.append("<section><h3>Address</h3><a href=\"#\">Trumbull, CT</a></section>")
+    if email:
+        sections.append(f"<section><h3>Email</h3><a href=\"mailto:{email}\">{email}</a></section>")
+    body = json.dumps("".join(sections))
+    # Like LinkedIn: the dialog appears first, its sections a moment later.
+    return f"""<!doctype html><html><body><main>Profile page</main>
+<div role="dialog" aria-labelledby="t"><h2 id="t">Contact info</h2><div id="c"></div>
+<button>Edit contact info</button></div>
+<script>setTimeout(() => {{ document.getElementById("c").innerHTML = {body}; }}, 300);</script>
+</body></html>"""
 
 
 def _handler(fake, *args, **kwargs):
     class Handler(SimpleHTTPRequestHandler):
         def do_GET(self):
+            if self.path.startswith("/in/"):
+                slug = self.path.split("/")[2]
+                fake.linkedin_visits.append(self.path)
+                if not fake.linkedin_logged_in:
+                    self.send_response(302)
+                    self.send_header("Location", "/authwall?trk=x")
+                    self.end_headers()
+                    return
+                if slug in fake.linkedin_profiles:
+                    html = linkedin_contact_info_html(slug, *fake.linkedin_profiles[slug])
+                else:
+                    html = "<html><body><h1>This page doesn\u2019t exist</h1></body></html>"
+                data = html.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            if self.path.startswith("/authwall"):
+                self.path = "/sign-in.html"
             if self.path.startswith("/contact-tracker"):
                 if not fake.logged_in:
                     self.send_response(302)
@@ -82,7 +130,8 @@ def site():
     fake = FakeTeal()
     server = ThreadingHTTPServer(("127.0.0.1", 0), partial(_handler, fake))
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    fake.url = f"http://127.0.0.1:{server.server_address[1]}/contact-tracker"
+    fake.origin = f"http://127.0.0.1:{server.server_address[1]}"
+    fake.url = f"{fake.origin}/contact-tracker"
     yield fake
     server.shutdown()
 
@@ -108,6 +157,8 @@ def chrome_page(site, tmp_path_factory):
 def fresh(site, chrome_page):
     site.saved.clear()
     site.logged_in = True
+    site.linkedin_logged_in = True
+    site.linkedin_visits.clear()
     chrome_page.goto("about:blank")
     return site, chrome_page
 
@@ -124,7 +175,7 @@ class ScriptedPrompter(Prompter):
         super().__init__(fake_input)
 
 
-def make_run(tmp_path, site, page, rows, answers=(), **options):
+def make_run(tmp_path, site, page, rows, answers=(), linkedin=False, **options):
     path = make_xlsx(tmp_path / "contacts.xlsx", TEAL_HEADERS, rows)
     sheet = load_contacts(path)
     run = Run(
@@ -132,6 +183,8 @@ def make_run(tmp_path, site, page, rows, answers=(), **options):
         teal=TealPage(page, site.url, timeout_ms=5_000),
         options=Options(delay=0, backoff=0.1, **options),
         prompter=ScriptedPrompter(answers), failures_dir=tmp_path / "failures",
+        linkedin=(LinkedInPage(page.context, timeout_ms=5_000, origin=site.origin)
+                  if linkedin else None),
         sleep=lambda s: None,
     )
     return run, sheet
@@ -144,7 +197,7 @@ def test_saves_contacts_and_writes_back_answers(tmp_path, fresh):
                  position="WW CTO Global Accounts", company="Lenovo"),
         teal_row("Jane", "Doe", "https://www.linkedin.com/in/jane", email="jane@x.com",
                  phone=5550100123),
-    ], answers=["not-an-email", "ed@lenovo.com", "", ""], auto_save=True)
+    ], answers=["not-an-email", "ed@lenovo.com", "", ""], auto_save=True, ask_missing=True)
 
     summary = run.run(sheet.contacts)
 
@@ -278,3 +331,91 @@ def test_input_closing_stops_cleanly(tmp_path, fresh):
     assert [c.name for c in summary.done] == ["A One"]
     assert summary.not_reached == 1
     assert run.state.status("https://www.linkedin.com/in/b") == "pending"
+
+
+def test_linkedin_fills_blank_email_and_phone(tmp_path, fresh):
+    site, page = fresh
+    run, sheet = make_run(tmp_path, site, page, [
+        teal_row("Ed", "Soo Hoo", "https://www.linkedin.com/in/edsoohoo"),
+        teal_row("Pho", "Ne", "https://www.linkedin.com/in/phoneonly"),
+        teal_row("Pri", "Vate", "https://www.linkedin.com/in/private"),
+        teal_row("Has", "Both", "https://www.linkedin.com/in/hasboth", email="sheet@x.com", phone="1"),
+    ], linkedin=True, auto_save=True)
+
+    summary = run.run(sheet.contacts)
+
+    assert len(summary.done) == 4
+    by_name = {s["first_name"]: s for s in site.saved}
+    # (the stand-in form reformats 10-digit numbers, like many real forms)
+    assert (by_name["Ed"]["email"], by_name["Ed"]["phone"]) == ("ed@lenovo.com", "(203) 555-0100")
+    assert (by_name["Pho"]["email"], by_name["Pho"]["phone"]) == ("", "+1 (212) 555-0199")
+    assert (by_name["Pri"]["email"], by_name["Pri"]["phone"]) == ("", "")
+    # The spreadsheet wins: no LinkedIn visit when nothing is blank.
+    assert not any("hasboth" in v for v in site.linkedin_visits)
+    assert all(v.endswith("/overlay/contact-info/") for v in site.linkedin_visits)
+    assert run.prompter.questions == []  # nothing asked without --ask-missing
+    # Found values are written back to the spreadsheet.
+    reloaded = load_contacts(sheet.path).contacts
+    assert (reloaded[0].email, reloaded[0].phone) == ("ed@lenovo.com", "203-555-0100")
+    assert reloaded[1].phone == "+1 (212) 555-0199"
+
+
+def test_linkedin_then_ask_for_what_is_still_missing(tmp_path, fresh):
+    site, page = fresh
+    run, sheet = make_run(tmp_path, site, page, [
+        teal_row("Pho", "Ne", "https://www.linkedin.com/in/phoneonly"),
+    ], answers=["typed@x.com"], linkedin=True, auto_save=True, ask_missing=True)
+
+    run.run(sheet.contacts)
+
+    assert len(run.prompter.questions) == 1 and "Email" in run.prompter.questions[0]
+    assert (site.saved[0]["email"], site.saved[0]["phone"]) == ("typed@x.com", "+1 (212) 555-0199")
+
+
+def test_linkedin_missing_profile_still_creates_contact(tmp_path, fresh):
+    site, page = fresh
+    run, sheet = make_run(tmp_path, site, page, [
+        teal_row("Gone", "Away", "https://www.linkedin.com/in/no-such-person"),
+    ], linkedin=True, auto_save=True)
+
+    summary = run.run(sheet.contacts)
+
+    assert len(summary.done) == 1
+    assert site.saved[0]["email"] == ""
+
+
+def test_linkedin_sign_in_prompt(tmp_path, fresh):
+    site, page = fresh
+    site.linkedin_logged_in = False
+    run, sheet = make_run(tmp_path, site, page, [
+        teal_row("Ed", "Soo Hoo", "https://www.linkedin.com/in/edsoohoo"),
+    ], linkedin=True, auto_save=True)
+    questions = []
+
+    def sign_in(question):
+        questions.append(question)
+        site.linkedin_logged_in = True
+        return ""
+
+    run.prompter = Prompter(sign_in)
+    summary = run.run(sheet.contacts)
+
+    assert "Sign in to LinkedIn" in questions[0]
+    assert len(summary.done) == 1
+    assert site.saved[0]["email"] == "ed@lenovo.com"
+
+
+def test_linkedin_checked_once_per_contact(tmp_path, fresh):
+    site, page = fresh
+    rows = [teal_row("Pri", "Vate", "https://www.linkedin.com/in/private")]
+    run, sheet = make_run(tmp_path, site, page, rows, linkedin=True, dry_run=True)
+    run.run(sheet.contacts)
+    run.run(sheet.contacts)
+    assert len(site.linkedin_visits) == 2  # dry runs don't record anything
+
+    run, sheet = make_run(tmp_path, site, page, rows, linkedin=True, answers=["s"])
+    run.run(sheet.contacts)  # skipped at review, so the row stays retryable
+    run.prompter = ScriptedPrompter([""])
+    run.run(sheet.contacts)
+    assert len(site.linkedin_visits) == 3  # but LinkedIn isn't looked up again
+    assert run.state.is_done("https://www.linkedin.com/in/private")

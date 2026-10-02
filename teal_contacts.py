@@ -4,6 +4,7 @@
     python teal_contacts.py contacts.xlsx --limit 1     # just the first pending contact
     python teal_contacts.py contacts.xlsx --dry-run     # fill forms, never save
     python teal_contacts.py contacts.xlsx --auto-save   # no review pause
+    python teal_contacts.py contacts.xlsx --ask-missing # ask me for email/phone LinkedIn lacks
     python teal_contacts.py contacts.xlsx --check       # only validate the spreadsheet
     python teal_contacts.py contacts.xlsx --reset       # forget progress, start over
 
@@ -35,8 +36,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Click Save Contact without pausing for review")
     p.add_argument("--dry-run", action="store_true",
                    help="Do everything except Save (forms are filled, then cancelled)")
-    p.add_argument("--delay", type=float, default=2.0, metavar="SECONDS",
-                   help="Pause between contacts (default: 2, randomised up to +50%%)")
+    p.add_argument("--no-linkedin", action="store_true",
+                   help="Don't look up blank Email/Phone on the contact's LinkedIn Contact info")
+    p.add_argument("--ask-missing", action="store_true",
+                   help="Ask in the terminal for Email/Phone that are still blank")
+    p.add_argument("--delay", type=float, default=4.0, metavar="SECONDS",
+                   help="Pause between contacts (default: 4, randomised up to +50%%)")
     p.add_argument("--retries", type=int, default=2,
                    help="Retries when Teal's page or form doesn't load (default: 2)")
     p.add_argument("--timeout", type=float, default=20, metavar="SECONDS",
@@ -47,6 +52,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--port", type=int, default=None, help="Chrome debugging port (default: 9333)")
     # For testing against a stand-in page.
     p.add_argument("--teal-url", help=argparse.SUPPRESS)
+    p.add_argument("--linkedin-url", help=argparse.SUPPRESS)
     p.add_argument("--chrome-arg", action="append", default=[], help=argparse.SUPPRESS)
     args = p.parse_args(argv)
     if args.limit is not None and args.limit < 1:
@@ -56,7 +62,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     return args
 
 
-def list_pending(sheet: Sheet, state: RunState, invalid: list[Contact]) -> None:
+def list_pending(sheet: Sheet, state: RunState, invalid: list[Contact],
+                 linkedin: bool = True, ask: bool = False) -> None:
     valid = [c for c in sheet.contacts if c.is_valid]
     counts = state.counts(c.key for c in valid)
     where = f" (sheet '{sheet.sheet_name}')" if sheet.sheet_name else ""
@@ -77,7 +84,13 @@ def list_pending(sheet: Sheet, state: RunState, invalid: list[Contact]) -> None:
         if status != PENDING:
             notes.append(f"{status} last time: {state.recall(c.key, 'reason') or ''}".rstrip(": "))
         if missing:
-            notes.append(f"will ask for {' and '.join(missing)}")
+            how = []
+            if linkedin and not state.recall(c.key, "linkedin_checked"):
+                how.append("look up on LinkedIn")
+            if ask:
+                how.append("ask")
+            if how:
+                notes.append(f"no {' or '.join(missing)}: will {', then '.join(how)}")
         note = f"  ({'; '.join(notes)})" if notes else ""
         print(f"  - row {c.row_number} {c.name} | {c.title} @ {c.company}{note}")
 
@@ -111,7 +124,7 @@ def main(argv=None) -> int:
 
     invalid = [c for c in sheet.contacts if not c.is_valid]
     if args.check:
-        list_pending(sheet, state, invalid)
+        list_pending(sheet, state, invalid, linkedin=not args.no_linkedin, ask=args.ask_missing)
         return 0
 
     valid = [c for c in sheet.contacts if c.is_valid]
@@ -124,6 +137,7 @@ def main(argv=None) -> int:
     from playwright.sync_api import sync_playwright
 
     from teal_rpa import browser
+    from teal_rpa.linkedin import LINKEDIN_ORIGIN, LinkedInPage
     from teal_rpa.runner import Options, Prompter, Run, Summary, print_summary, say, setup_logging
     from teal_rpa.teal import TRACKER_URL, TealPage
 
@@ -140,7 +154,8 @@ def main(argv=None) -> int:
 
     tracker_url = args.teal_url or TRACKER_URL
     options = Options(auto_save=args.auto_save, dry_run=args.dry_run, limit=args.limit,
-                      delay=args.delay, retries=args.retries)
+                      delay=args.delay, retries=args.retries,
+                      linkedin=not args.no_linkedin, ask_missing=args.ask_missing)
     try:
         with sync_playwright() as pw:
             endpoint = browser.ensure_chrome(
@@ -156,7 +171,9 @@ def main(argv=None) -> int:
             run = Run(sheet=sheet, state=state,
                       teal=TealPage(page, tracker_url, timeout_ms=int(args.timeout * 1000)),
                       options=options, prompter=Prompter(),
-                      failures_dir=out_dir / "failures")
+                      failures_dir=out_dir / "failures",
+                      linkedin=LinkedInPage(context, timeout_ms=int(args.timeout * 1000),
+                                            origin=args.linkedin_url or LINKEDIN_ORIGIN))
             summary = run.run(todo)
     except browser.BrowserError as exc:
         say(f"Error: {exc}")
