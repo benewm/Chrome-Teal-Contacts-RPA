@@ -196,7 +196,9 @@ function openCalendar(button, c) {
     }));
     pop.querySelectorAll("[data-pick]").forEach((b) => b.addEventListener("click", () => {
       if (!b.dataset.pick) return;  // faded days do nothing here
-      const iso = `${year}-${String(month + 1).padStart(2, "0")}-${String(b.dataset.pick).padStart(2, "0")}`;
+      // Like Teal: the saved date is the day BEFORE the one clicked (unless dateBug is off).
+      const when = new Date(year, month, Number(b.dataset.pick) - (CFG.dateBug === false ? 0 : 1));
+      const iso = `${when.getFullYear()}-${String(when.getMonth() + 1).padStart(2, "0")}-${String(when.getDate()).padStart(2, "0")}`;
       closePopups(); update(c.id, {[field]: iso});
     }));
   }

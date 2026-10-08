@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 from playwright.sync_api import Error as PlaywrightError
@@ -85,6 +85,10 @@ OUTSIDE_DAY_JS = """e => [e, e.parentElement].some(n => n && (
     || n.getAttribute('aria-disabled') === 'true' || n.disabled === true))"""
 
 
+# Teal saves the day before the one clicked in its calendars, so click one day later.
+DATE_CLICK_SHIFT_DAYS = 1
+
+
 class TealError(Exception):
     """Something went wrong that's safe to retry (nothing was created)."""
 
@@ -147,6 +151,9 @@ class TealPage:
         self.timeout_ms = timeout_ms
         self.known: list[dict] = []          # objects with ids seen in Teal's responses
         self.debug_dir: Path | None = None   # where to keep HTML of misbehaving widgets
+        # Days to add to a date before clicking it (Teal saves the day before
+        # the one clicked); corrected automatically if Teal behaves differently.
+        self.date_shift_days = DATE_CLICK_SHIFT_DAYS
         self._responses: list[Response] = []
         page.on("response", self._on_response)
 
@@ -519,41 +526,64 @@ class TealPage:
     def set_date(self, field: str, iso: str) -> None:
         """Pick a date in a calendar-only date field.
 
-        The field is a button ("Add a date" or MM/DD/YYYY) that opens a calendar
-        popup; the button's aria-controls names the popup, so everything below
-        looks only inside it.
+        Teal has a bug: the day you click is saved one day earlier (click the
+        10th, the field shows the 9th). So the tool clicks one day later than
+        wanted, then checks what the field shows. If Teal's shift is ever
+        different (or fixed), it picks again with the shift it saw, and uses
+        that shift for the rest of the run.
         """
-        section, label = DATE_FIELDS[field]
+        label = DATE_FIELDS[field][1]
         target = date.fromisoformat(iso)
+        for attempt in range(2):
+            pick = target + timedelta(days=self.date_shift_days)
+            shown = self._pick_date(field, pick)
+            if shown == target:
+                return
+            if shown is None:
+                break
+            # Teal saved `shown` for a click on `pick`: learn its actual shift.
+            self.date_shift_days = (pick - shown).days
+            log_shift = f"Teal saved {shown:%m/%d/%Y} for a click on {pick:%m/%d/%Y}"
+        raise TealError(f"Couldn't set {label} to {target:%m/%d/%Y}: "
+                        + (log_shift if shown else "the field shows no date after picking one"))
+
+    def _pick_date(self, field: str, pick: date) -> date | None:
+        """Click `pick` in the field's calendar; return the date the field then shows."""
+        section, label = DATE_FIELDS[field]
         control = self._control(section, label)
+        before = self.read_date(field)
         popup = None
         try:
             control.click(timeout=self.timeout_ms)
             popup = self._calendar_popup(control)
             for _ in range(240):  # up to 20 years either way
                 shown = self._shown_month(popup)
-                steps = (target.year - shown[0]) * 12 + target.month - shown[1]
+                steps = (pick.year - shown[0]) * 12 + pick.month - shown[1]
                 if steps == 0:
                     break
                 self._month_button(popup, forward=steps > 0).click(timeout=self.timeout_ms)
                 self._wait_month_change(popup, shown)
             else:
-                raise TealError(f"Couldn't reach {target:%B %Y} in the {label} calendar")
-            self._day_button(popup, target).click(timeout=self.timeout_ms)
+                raise TealError(f"Couldn't reach {pick:%B %Y} in the {label} calendar")
+            self._day_button(popup, pick).click(timeout=self.timeout_ms)
             self.page.wait_for_timeout(300)
             if popup.is_visible():
                 self.page.keyboard.press("Escape")
-            # The button should now show the date (MM/DD/YYYY).
-            shown = self.read_date(field)
-            if shown != target.isoformat():
-                raise TealError(f"Clicked {target:%m/%d/%Y} in the {label} calendar, but the "
-                                f"field shows {control.inner_text(timeout=2_000).strip()!r}")
         except (PlaywrightError, TealError) as exc:
             self._save_debug_html(f"calendar-{field}", popup)
             self.page.keyboard.press("Escape")
             if isinstance(exc, TealError):
                 raise
             raise TealError(f"Couldn't set {label}: {_short(exc)}") from exc
+
+        # The field updates once Teal has saved; give it a moment.
+        shown = self.read_date(field)
+        for _ in range(30):
+            if shown and shown != before:
+                break
+            self.page.wait_for_timeout(100)
+            shown = self.read_date(field)
+        return date.fromisoformat(shown) if shown else None
 
     def _calendar_popup(self, control: Locator) -> Locator:
         popup_id = control.get_attribute("aria-controls", timeout=self.timeout_ms)

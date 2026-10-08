@@ -286,6 +286,11 @@ or Last contacted calendar didn't behave as expected. The calendar's HTML is sav
 as `failures\calendar-follow_up-<number>.html` (with a screenshot `row-<N>.png`);
 send those along when reporting it.
 
+**Dates one day off**: Teal saves the day before the one clicked in its calendars,
+so the tool clicks the next day (to get 10/10/2026 it clicks the 11th). It checks
+what the field shows afterwards; if Teal ever behaves differently, it adjusts by
+itself. The shift is `DATE_CLICK_SHIFT_DAYS` in `teal_rpa/teal.py`.
+
 **"Teal contact <ID> didn't open"**: the contact was deleted in Teal, or the
 `teal_contact_id` cell is wrong. Clear the cell (and `--reset` if needed) to create
 it again.

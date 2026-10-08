@@ -442,6 +442,31 @@ def test_calendar_days_without_any_markings(tmp_path, sites, page):
     assert (ed["follow_up"], ed["last_contacted"]) == ("2026-10-10", "2026-11-30")
 
 
+def test_dates_across_month_end_with_teals_off_by_one(tmp_path, sites, page):
+    # Wanting Oct 31 means clicking Nov 1 (Teal saves the day before).
+    run = make_run(tmp_path, sites, page, [
+        row("Ed", "Soo Hoo", "edsoohoo", email="ed@x.com", phone="1",
+            follow_up="2026-10-31", last_contacted="2026-12-31"),
+    ], linkedin=False)
+
+    assert len(run_both(run).done) == 1
+    ed = sites.by_name("Ed")
+    assert (ed["follow_up"], ed["last_contacted"]) == ("2026-10-31", "2026-12-31")
+
+
+def test_dates_still_right_if_teal_fixes_its_date_bug(tmp_path, sites, page):
+    sites.config = {"dateBug": False}
+    run = make_run(tmp_path, sites, page, [
+        row("Ed", "Soo Hoo", "edsoohoo", email="ed@x.com", phone="1",
+            follow_up="2026-10-10", last_contacted="2026-09-01"),
+    ], linkedin=False)
+
+    assert len(run_both(run).done) == 1
+    ed = sites.by_name("Ed")
+    assert (ed["follow_up"], ed["last_contacted"]) == ("2026-10-10", "2026-09-01")
+    assert run.teal.date_shift_days == 0  # learned from the first date
+
+
 # -- things that don't work out -------------------------------------------------
 
 def test_calendar_problem_keeps_its_html(tmp_path, sites, page):
@@ -452,7 +477,7 @@ def test_calendar_problem_keeps_its_html(tmp_path, sites, page):
 
     [(_, reason)] = run_both(run).failed
 
-    assert "Couldn't find day 10 in the calendar (it shows: 27 28 29 30 1 2 3" in reason
+    assert "Couldn't find day 11 in the calendar (it shows: 27 28 29 30 1 2 3" in reason  # 10th + Teal's shift
     [saved] = (tmp_path / "failures").glob("calendar-follow_up-*.html")
     assert "October 2026" in saved.read_text() and 'role="grid"' in saved.read_text()
 
