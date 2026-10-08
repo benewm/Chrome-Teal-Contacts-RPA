@@ -1,24 +1,36 @@
-"""Drive Teal's "Add a New Contact" form on app.tealhq.com/contact-tracker.
+"""Drive Teal's contact tracker on app.tealhq.com.
+
+Two screens are involved:
+  * the tracker list (/contact-tracker), with "+ Add a New Contact", whose
+    form opens in an iframe; Save returns to the list;
+  * a contact's page (/contact-tracker/<id>): Relationship, Goal and Status
+    dropdowns, Follow up / Last contacted calendars (saved automatically, no
+    Save button), Contact Information, and an Edit button for the basics.
 
 If Teal changes its page, the strings below are the first thing to update.
-Fields are found by their placeholder text, which is what's shown greyed out
-inside each empty box.
+Form boxes are found by their placeholder (the grey hint in an empty box);
+page fields by the label shown above them.
 """
 
 from __future__ import annotations
 
+import re
 import time
+from datetime import date
 from pathlib import Path
 
 from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import Frame, Page
+from playwright.sync_api import Frame, Locator, Page, Response
+
+from .spreadsheet import normalize_linkedin_url, parse_date
 
 TRACKER_URL = "https://app.tealhq.com/contact-tracker"
 ADD_BUTTON = "Add a New Contact"  # button on the tracker page
-SAVE_BUTTON = "Save Contact"      # buttons inside the form
+SAVE_BUTTON = re.compile(r"^\s*(Save|Update)( Contact| Changes)?\s*$", re.I)  # in the forms
 CANCEL_BUTTON = "Cancel"
+EDIT_BUTTON = "Edit"              # on a contact's page
 
-# Contact field -> placeholder of the matching box in Teal's form.
+# Contact field -> placeholder of the matching box in Teal's Add/Edit form.
 FIELD_PLACEHOLDERS: dict[str, str] = {
     "first_name": "First Name",
     "last_name": "Last Name",
@@ -33,9 +45,38 @@ FIELD_PLACEHOLDERS: dict[str, str] = {
 # Used to recognise the form among the page's frames.
 FORM_MARKER_FIELD = "first_name"
 
+# Fields on a contact's page: field -> (section heading, field label).
+CHOICE_FIELDS = {
+    "relationship": ("Networking", "Relationship"),
+    "goal": ("Networking", "Goal"),
+    "status": ("Networking", "Status"),
+}
+DATE_FIELDS = {
+    "follow_up": ("Dates", "Follow up"),
+    "last_contacted": ("Dates", "Last contacted"),
+}
+CONTACT_INFO_SECTION = "Contact Information"
+CONTACT_INFO_LABELS = {"email": "Email", "url": "LinkedIn", "phone": "Phone Number", "twitter": "Twitter"}
+
+# Teal's dropdown options (October 2026), used to check the spreadsheet up front.
+# The tool always picks from what Teal actually offers, ignoring case.
+CHOICE_OPTIONS = {
+    "relationship": ["Self", "Co-worker", "Friend", "Family", "Other", "Recruiter",
+                     "Mentor", "Hiring manager", "Alumni"],
+    "goal": ["Networking", "Informational interview", "Request referral",
+             "Research interviewer", "Research career"],
+    "status": ["To be contacted", "Follow up needed", "Meeting scheduled", "Thank you sent"],
+}
+
+MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August",
+          "September", "October", "November", "December"]
+MONTH_CAPTION = re.compile(rf"^\s*({'|'.join(MONTHS)})\s+(\d{{4}})\s*$")
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+ID_KEYS = ("id", "uuid", "contact_id", "contactId", "_id")
+
 
 class TealError(Exception):
-    """Something went wrong before Save was clicked; safe to retry."""
+    """Something went wrong that's safe to retry (nothing was created)."""
 
 
 class NotLoggedIn(TealError):
@@ -47,37 +88,169 @@ class SaveUnconfirmed(Exception):
     the contact may have been created."""
 
 
+class NotAnOption(Exception):
+    """The spreadsheet's value isn't one of the dropdown's options."""
+
+
+def pick_option(value: str, options: list[str]) -> str | None:
+    """The option matching value, ignoring case and stray spaces/checkmarks."""
+    def norm(text: str) -> str:
+        return " ".join(text.replace("✓", "").split()).casefold()
+    wanted = norm(value)
+    return next((o for o in options if norm(o) == wanted), None)
+
+
+def objects_with_ids(data) -> list[dict]:
+    """Every JSON object (at any depth) that has a UUID id, as
+    {"id": ..., "strings": {lower-cased string values}}."""
+    found = []
+    stack = [data]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, list):
+            stack.extend(item)
+        elif isinstance(item, dict):
+            ident = next((item[k] for k in ID_KEYS
+                          if isinstance(item.get(k), str) and UUID_RE.match(item[k])), None)
+            if ident:
+                strings = {v.strip().casefold() for v in item.values() if isinstance(v, str) and v.strip()}
+                found.append({"id": ident, "strings": strings})
+            stack.extend(v for v in item.values() if isinstance(v, (dict, list)))
+    return found
+
+
+def match_kind(obj: dict, first: str, last: str, url: str) -> str | None:
+    """'url' if the object holds this LinkedIn URL, 'name' if just the name."""
+    if url:
+        for value in obj["strings"]:
+            if "linkedin.com/in/" in value and normalize_linkedin_url(value) == url.casefold():
+                return "url"
+    if first and last and first.casefold() in obj["strings"] and last.casefold() in obj["strings"]:
+        return "name"
+    return None
+
+
 class TealPage:
     def __init__(self, page: Page, tracker_url: str = TRACKER_URL, timeout_ms: int = 20_000):
         self.page = page
-        self.tracker_url = tracker_url
+        self.tracker_url = tracker_url.rstrip("/")
         self.timeout_ms = timeout_ms
+        self.known: list[dict] = []          # objects with ids seen in Teal's responses
+        self._responses: list[Response] = []
+        page.on("response", self._on_response)
 
-    # -- tracker page -------------------------------------------------------
+    # -- Teal's own data, as the page receives it ---------------------------
+
+    def _on_response(self, response: Response) -> None:
+        # Only note it here; bodies are read later (no blocking calls in events).
+        try:
+            if response.request.resource_type in ("xhr", "fetch") and \
+                    "json" in (response.headers.get("content-type") or ""):
+                self._responses.append(response)
+                del self._responses[:-200]
+        except Exception:
+            pass
+
+    def harvest(self) -> list[dict]:
+        """Read the JSON responses received since the last call."""
+        responses, self._responses = self._responses, []
+        found = []
+        for response in responses:
+            try:
+                found.extend(objects_with_ids(response.json()))
+            except Exception:
+                continue
+        self.known.extend(found)
+        return found
+
+    def current_id(self) -> str | None:
+        tail = self.page.url.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
+        return tail if UUID_RE.match(tail) else None
+
+    # -- tracker list ---------------------------------------------------------
 
     def open_tracker(self, reload: bool = False) -> None:
         """Make sure the contact tracker is showing with its Add button."""
         try:
-            if reload or not self.page.url.startswith(self.tracker_url):
+            if reload or self.page.url.split("?")[0].rstrip("/") != self.tracker_url:
                 self.page.goto(self.tracker_url, wait_until="domcontentloaded",
                                timeout=self.timeout_ms)
             self._add_button().wait_for(state="visible", timeout=self.timeout_ms)
         except PlaywrightError as exc:
-            url = self.page.url
-            if not url.startswith(self.tracker_url):
-                raise NotLoggedIn(f"Teal opened {url} instead of the contact tracker") from exc
+            self._raise_if_signed_out(exc)
             raise TealError(f"The '{ADD_BUTTON}' button didn't appear: {_short(exc)}") from exc
+        self.page.wait_for_timeout(300)  # let the list's data arrive
+        self.harvest()
 
-    def _add_button(self):
+    def _raise_if_signed_out(self, exc: Exception | None = None) -> None:
+        url = self.page.url
+        if not url.startswith(self.tracker_url):
+            raise NotLoggedIn(f"Teal opened {url} instead of the contact tracker") from exc
+
+    def _add_button(self) -> Locator:
         return self.page.get_by_role("button", name=ADD_BUTTON).first
 
-    # -- the form -----------------------------------------------------------
+    def ids_in_list(self, name: str) -> list[str]:
+        """Open each entry in the tracker list called `name`; return their ids."""
+        ids: list[str] = []
+        self.open_tracker(reload=True)
+        count = len(self._list_entries(name))
+        for index in range(count):
+            if index:
+                self.open_tracker(reload=True)
+            entries = self._list_entries(name)
+            if index >= len(entries):
+                break
+            try:
+                entries[index].click(timeout=self.timeout_ms)
+                self.page.wait_for_url(re.compile(r"/contact-tracker/[0-9a-f-]{36}"),
+                                       timeout=self.timeout_ms)
+            except PlaywrightError:
+                continue
+            ident = self.current_id()
+            if ident and ident not in ids:
+                ids.append(ident)
+        return ids
+
+    def _list_entries(self, name: str) -> list[Locator]:
+        # The name also appears as the open contact's heading; skip headings.
+        candidates = self.page.get_by_text(name, exact=True)
+        entries = []
+        for i in range(candidates.count()):
+            entry = candidates.nth(i)
+            try:
+                if entry.is_visible() and entry.evaluate(
+                        "e => !e.closest('h1,h2,h3,[role=heading]')"):
+                    entries.append(entry)
+            except PlaywrightError:
+                continue
+        return entries
+
+    def find_existing(self, first: str, last: str, url: str) -> str | None:
+        """Id of a contact already in Teal with this LinkedIn URL, or None."""
+        self.open_tracker()
+        for obj in reversed(self.known):
+            if match_kind(obj, first, last, url) == "url":
+                return obj["id"]
+        # Not in the data Teal sent; look the name up in the list and check
+        # each match's LinkedIn on its page.
+        name = f"{first} {last}".strip()
+        unconfirmed = []
+        for ident in self.ids_in_list(name):
+            self.open_record(ident)
+            record_url = self.read_record().get("url", "")
+            if record_url and normalize_linkedin_url(record_url) == url:
+                return ident
+            if not record_url:
+                unconfirmed.append(ident)
+        # Same name and no LinkedIn saved: treat as the same person only if unique.
+        return unconfirmed[0] if len(unconfirmed) == 1 else None
+
+    # -- Add / Edit form ------------------------------------------------------
 
     def open_form(self) -> Frame:
         """Click "Add a New Contact" and return the frame holding the form."""
-        stale = self._find_form_frame(timeout_ms=0)
-        if stale is not None:
-            self.cancel(stale)
+        self._close_stale_form()
         try:
             self._add_button().click(timeout=self.timeout_ms)
         except PlaywrightError as exc:
@@ -86,6 +259,26 @@ class TealPage:
         if frame is None:
             raise TealError("The Add a New Contact form didn't appear")
         return frame
+
+    def open_edit_form(self) -> Frame:
+        """On a contact's page, click Edit and return the form's frame."""
+        self._close_stale_form()
+        button = self.page.get_by_role("button", name=EDIT_BUTTON, exact=True)
+        if not button.count():
+            button = self.page.get_by_text(EDIT_BUTTON, exact=True)
+        try:
+            button.first.click(timeout=self.timeout_ms)
+        except PlaywrightError as exc:
+            raise TealError(f"Couldn't click '{EDIT_BUTTON}': {_short(exc)}") from exc
+        frame = self._find_form_frame(timeout_ms=self.timeout_ms)
+        if frame is None:
+            raise TealError("The Edit form didn't appear")
+        return frame
+
+    def _close_stale_form(self) -> None:
+        stale = self._find_form_frame(timeout_ms=0)
+        if stale is not None:
+            self.cancel(stale)
 
     def _find_form_frame(self, timeout_ms: int) -> Frame | None:
         # The form lives in an iframe; other iframes (chat widgets etc.) may
@@ -96,13 +289,16 @@ class TealPage:
             for frame in self.page.frames:
                 try:
                     if (frame.get_by_placeholder(marker, exact=True).first.is_visible()
-                            and frame.get_by_role("button", name=SAVE_BUTTON).first.is_visible()):
+                            and self._save_button(frame).is_visible()):
                         return frame
                 except PlaywrightError:
                     continue
             if time.monotonic() >= deadline:
                 return None
             self.page.wait_for_timeout(250)
+
+    def _save_button(self, frame: Frame) -> Locator:
+        return frame.get_by_role("button", name=SAVE_BUTTON).first
 
     def fill(self, frame: Frame, values: dict[str, str]) -> list[str]:
         """Type each non-blank value into its box, then check it stuck.
@@ -131,21 +327,41 @@ class TealPage:
         if frame.is_detached():
             return False
         try:
-            return frame.get_by_role("button", name=SAVE_BUTTON).first.is_visible()
+            return self._save_button(frame).is_visible()
         except PlaywrightError:
             return False
 
-    def save(self, frame: Frame) -> None:
+    def save(self, frame: Frame) -> list[dict]:
+        """Click Save; return the id-bearing objects Teal sent back."""
+        self.harvest()  # forget earlier responses
         try:
-            frame.get_by_role("button", name=SAVE_BUTTON).first.click(timeout=self.timeout_ms)
+            self._save_button(frame).click(timeout=self.timeout_ms)
         except PlaywrightError as exc:
-            raise TealError(f"Couldn't click '{SAVE_BUTTON}': {_short(exc)}") from exc
+            raise TealError(f"Couldn't click Save: {_short(exc)}") from exc
         if not self._wait_closed(frame):
             problem = self._form_errors(frame)
             raise SaveUnconfirmed(
-                "Clicked Save Contact but the form stayed open"
-                + (f" ({problem})" if problem else "")
+                "Clicked Save but the form stayed open" + (f" ({problem})" if problem else "")
             )
+        self.page.wait_for_timeout(500)
+        return self.harvest()
+
+    def create(self, frame: Frame, first: str, last: str, url: str) -> str | None:
+        """Save the filled Add form; return the new contact's id if found."""
+        returned = self.save(frame)
+        for kind in ("url", "name"):
+            ids = {o["id"] for o in returned if match_kind(o, first, last, url) == kind}
+            if len(ids) == 1:
+                return ids.pop()
+        # Not in Teal's reply: find it in the list (Save returns there).
+        ids = self.ids_in_list(f"{first} {last}".strip())
+        if len(ids) == 1:
+            return ids[0]
+        for ident in ids:  # several with this name: the one with this LinkedIn
+            self.open_record(ident)
+            if normalize_linkedin_url(self.read_record().get("url", "")) == url:
+                return ident
+        return None
 
     def cancel(self, frame: Frame) -> None:
         """Close the form without saving. Best effort."""
@@ -179,10 +395,188 @@ class TealPage:
             pass
         return "; ".join(messages)
 
+    # -- a contact's page -------------------------------------------------------
+
+    def open_record(self, ident: str, reload: bool = False) -> None:
+        try:
+            if reload or self.current_id() != ident:
+                self.page.goto(f"{self.tracker_url}/{ident}", wait_until="domcontentloaded",
+                               timeout=self.timeout_ms)
+            self._control(*CHOICE_FIELDS["relationship"]).wait_for(
+                state="visible", timeout=self.timeout_ms)
+            self.page.get_by_text(CONTACT_INFO_SECTION, exact=True).first.wait_for(
+                state="visible", timeout=self.timeout_ms)
+        except PlaywrightError as exc:
+            self._raise_if_signed_out(exc)
+            raise TealError(f"Teal contact {ident} didn't open: {_short(exc)}") from exc
+
+    def _control(self, section: str, label: str) -> Locator:
+        """The dropdown / date button that follows `label` within `section`."""
+        return self.page.locator(
+            f"xpath=//*[normalize-space(text())='{section}']"
+            f"/following::*[normalize-space(text())='{label}'][1]"
+            f"/following::*[self::button or self::select or self::input or @role='combobox'][1]"
+        ).first
+
+    def read_record(self) -> dict[str, str]:
+        """What the open contact's page shows, keyed like compare.LABELS."""
+        try:
+            lines = [line.strip() for line in
+                     self.page.locator("body").inner_text(timeout=self.timeout_ms).splitlines()
+                     if line.strip()]
+        except PlaywrightError as exc:
+            raise TealError(f"Couldn't read the contact's page: {_short(exc)}") from exc
+        record: dict[str, str] = {}
+
+        # Header: name, then "Title at Company", then the Edit (and Delete) buttons,
+        # which can come out on one line.
+        edit_line = next((i for i, line in enumerate(lines)
+                          if re.match(rf"^{EDIT_BUTTON}\b", line)), None)
+        if edit_line is not None:
+            record["name"] = lines[edit_line - 2] if edit_line >= 2 else ""
+            record["headline"] = lines[edit_line - 1] if edit_line >= 1 else ""
+
+        if CONTACT_INFO_SECTION in lines:
+            section = lines[lines.index(CONTACT_INFO_SECTION) + 1:]
+            for field, label in CONTACT_INFO_LABELS.items():
+                if label in section:
+                    j = section.index(label)
+                    value = section[j + 1] if j + 1 < len(section) else ""
+                    record[field] = "" if value in ("-", "–", "—") or \
+                        value in CONTACT_INFO_LABELS.values() else value
+
+        for field in CHOICE_FIELDS:
+            record[field] = self.read_choice(field)
+        for field in DATE_FIELDS:
+            record[field] = self.read_date(field)
+        return record
+
+    def read_choice(self, field: str) -> str:
+        control = self._control(*CHOICE_FIELDS[field])
+        try:
+            if control.evaluate("e => e.tagName") == "SELECT":
+                text = control.evaluate("e => e.options[e.selectedIndex]?.text || ''").strip()
+            else:
+                text = control.inner_text(timeout=self.timeout_ms).strip()
+        except PlaywrightError:
+            return ""
+        # An empty dropdown shows a placeholder such as "Select...".
+        if re.match(r"^(select|choose)\b", text, re.I) and not pick_option(text, CHOICE_OPTIONS[field]):
+            return ""
+        return text
+
+    def read_date(self, field: str) -> str:
+        control = self._control(*DATE_FIELDS[field])
+        try:
+            text = (control.input_value(timeout=2_000)
+                    if control.evaluate("e => e.tagName") == "INPUT"
+                    else control.inner_text(timeout=self.timeout_ms))
+            found = re.search(r"\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{1,2}-\d{1,2}", text)
+            parsed = parse_date(found.group(0)) if found else None
+        except (PlaywrightError, ValueError):
+            return ""
+        return parsed.isoformat() if parsed else ""
+
+    def set_choice(self, field: str, value: str) -> str:
+        """Pick `value` in a dropdown; returns the option's exact label."""
+        section, label = CHOICE_FIELDS[field]
+        control = self._control(section, label)
+        try:
+            if control.evaluate("e => e.tagName") == "SELECT":
+                options = [o.strip() for o in control.locator("option").all_inner_texts()]
+                match = pick_option(value, options)
+                if not match:
+                    raise NotAnOption(f"{label}: {value!r} isn't one of Teal's options "
+                                      f"({', '.join(o for o in options if o)})")
+                control.select_option(label=match, timeout=self.timeout_ms)
+                return match
+            control.click(timeout=self.timeout_ms)
+            options = self.page.get_by_role("option")
+            options.first.wait_for(state="visible", timeout=self.timeout_ms)
+            texts = [t.strip() for t in options.all_inner_texts()]
+            match = pick_option(value, texts)
+            if not match:
+                self.page.keyboard.press("Escape")
+                raise NotAnOption(f"{label}: {value!r} isn't one of Teal's options "
+                                  f"({', '.join(texts)})")
+            options.nth(texts.index(match)).click(timeout=self.timeout_ms)
+            return match
+        except PlaywrightError as exc:
+            self.page.keyboard.press("Escape")
+            raise TealError(f"Couldn't set {label}: {_short(exc)}") from exc
+
+    def set_date(self, field: str, iso: str) -> None:
+        """Pick a date in a calendar-only date field."""
+        section, label = DATE_FIELDS[field]
+        target = date.fromisoformat(iso)
+        try:
+            self._control(section, label).click(timeout=self.timeout_ms)
+            caption = self.page.get_by_text(MONTH_CAPTION).first
+            caption.wait_for(state="visible", timeout=self.timeout_ms)
+            calendar = caption.locator(
+                "xpath=ancestor::*[descendant::table or descendant::*[@role='grid']][1]")
+            for _ in range(240):  # up to 20 years either way
+                month_name, year = MONTH_CAPTION.match(caption.inner_text()).groups()
+                shown = (int(year), MONTHS.index(month_name) + 1)
+                steps = (target.year - shown[0]) * 12 + target.month - shown[1]
+                if steps == 0:
+                    break
+                self._month_button(calendar, forward=steps > 0).click(timeout=self.timeout_ms)
+                self._wait_caption_change(caption, shown)
+            else:
+                raise TealError(f"Couldn't reach {target:%B %Y} in the {label} calendar")
+            self._day_button(calendar, target.day).click(timeout=self.timeout_ms)
+            self.page.wait_for_timeout(300)
+            if caption.is_visible():
+                self.page.keyboard.press("Escape")
+        except PlaywrightError as exc:
+            self.page.keyboard.press("Escape")
+            raise TealError(f"Couldn't set {label}: {_short(exc)}") from exc
+
+    def _month_button(self, calendar: Locator, forward: bool) -> Locator:
+        named = calendar.get_by_role(
+            "button", name=re.compile(r"next" if forward else r"prev", re.I))
+        if named.count():
+            return named.first
+        # Unlabelled arrow buttons: the icon-only ones, previous then next.
+        icons = [b for b in calendar.locator("button").all() if not b.inner_text().strip()]
+        if len(icons) < 2:
+            raise TealError("Couldn't find the calendar's month arrows")
+        return icons[-1] if forward else icons[0]
+
+    def _wait_caption_change(self, caption: Locator, shown: tuple[int, int]) -> None:
+        for _ in range(40):
+            text = caption.inner_text()
+            month_name, year = MONTH_CAPTION.match(text).groups()
+            if (int(year), MONTHS.index(month_name) + 1) != shown:
+                return
+            self.page.wait_for_timeout(50)
+
+    def _day_button(self, calendar: Locator, day: int) -> Locator:
+        candidates = calendar.locator("button, [role=gridcell]").filter(
+            has_text=re.compile(rf"^\s*{day}\s*$"))
+        # Skip the faded days from the months either side.
+        inside = []
+        for i in range(candidates.count()):
+            cell = candidates.nth(i)
+            outside = cell.evaluate(
+                "e => [e, e.parentElement].some(n => n && (/outside/i.test(n.className || '')"
+                " || n.dataset?.outside === 'true' || n.getAttribute('aria-disabled') === 'true'))")
+            if not outside:
+                inside.append(cell)
+        if not inside:
+            raise TealError(f"Couldn't find day {day} in the calendar")
+        # If outside days can't be told apart: early days come first, late days last.
+        return inside[0] if day < 15 else inside[-1]
+
+    def settle(self, ms: int = 1500) -> None:
+        """Give Teal time to save changes made on the page (it saves by itself)."""
+        self.page.wait_for_timeout(ms)
+
     def screenshot(self, path: Path) -> Path | None:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            self.page.screenshot(path=str(path))
+            self.page.screenshot(path=str(path), timeout=10_000)
             return path
         except PlaywrightError:
             return None

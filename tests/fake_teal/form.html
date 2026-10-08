@@ -2,7 +2,7 @@
 <html><head><meta charset="utf-8"></head>
 <body>
   <button aria-label="Close" onclick="parent.postMessage({type:'cancel'}, '*')">×</button>
-  <h2>Add a New Contact</h2>
+  <h2 id="title">Add a New Contact</h2>
   <form id="f">
     <label>First Name</label><input name="first_name" placeholder="First Name">
     <label>Last Name</label><input name="last_name" placeholder="Last Name">
@@ -18,20 +18,34 @@
     <button type="submit">Save Contact</button>
   </form>
 <script>
-  const phone = document.querySelector("input[name=phone]");
+  const id = new URLSearchParams(location.search).get("id");
+  const form = document.getElementById("f");
+  async function call(method, path, body) {
+    const res = await fetch(path, {method, body: body ? JSON.stringify(body) : undefined});
+    return JSON.parse(await res.text());
+  }
+  if (id) {
+    document.getElementById("title").textContent = "Edit Contact";
+    call("GET", "/api/contacts").then(({data}) => {
+      const c = data.find((x) => x.id === id);
+      for (const input of form.querySelectorAll("input")) input.value = c[input.name] || "";
+    });
+  }
+  const phone = form.querySelector("input[name=phone]");
   phone.addEventListener("input", () => {
     const d = phone.value.replace(/\D/g, "");
     if (d.length === 10) phone.value = `(${d.slice(0,3)}) ${d.slice(3,6)}-${d.slice(6)}`;
   });
-  document.getElementById("f").addEventListener("submit", async (e) => {
+  form.addEventListener("submit", async (e) => {
     e.preventDefault();
-    const data = Object.fromEntries(new FormData(e.target));
+    const data = Object.fromEntries(new FormData(form));
     if (data.email.includes("invalid")) {
       document.getElementById("error").innerHTML = '<p role="alert">Please enter a valid email</p>';
       return;
     }
-    await fetch("/api/contacts", {method: "POST", body: JSON.stringify(data)});
-    parent.postMessage({type: "contact-saved", name: data.first_name + " " + data.last_name}, "*");
+    if (id) await call("PATCH", `/api/contacts/${id}`, data);
+    else await call("POST", "/api/contacts", data);
+    parent.postMessage({type: "contact-saved", created: !id}, "*");
   });
 </script>
 </body></html>

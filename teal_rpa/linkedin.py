@@ -8,7 +8,7 @@ shared them with you (usually 1st-degree connections), so blanks are normal.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import unquote
 
 from playwright.sync_api import BrowserContext, Page
@@ -34,10 +34,18 @@ class LinkedInError(Exception):
 
 @dataclass
 class ContactInfo:
-    email: str = ""
-    phone: str = ""
+    emails: list[str] = field(default_factory=list)
+    phones: list[str] = field(default_factory=list)
     note: str | None = None  # why nothing was found, if known
     dialog_text: str = ""    # what the Contact info box showed, for troubleshooting
+
+    @property
+    def email(self) -> str:
+        return self.emails[0] if self.emails else ""
+
+    @property
+    def phone(self) -> str:
+        return self.phones[0] if self.phones else ""
 
 
 def contact_info_url(profile_url: str, origin: str = LINKEDIN_ORIGIN) -> str:
@@ -45,43 +53,45 @@ def contact_info_url(profile_url: str, origin: str = LINKEDIN_ORIGIN) -> str:
     return f"{origin}{path}/overlay/contact-info/"
 
 
-def parse_contact_info(text: str, mailto_href: str | None = None) -> ContactInfo:
-    """Pull email and phone out of the dialog's visible text.
+def parse_contact_info(text: str, mailto_hrefs: list[str] | str | None = None) -> ContactInfo:
+    """Pull every email and phone number out of the dialog's visible text.
 
     The dialog reads like:  Phone / 203-554-7770 (Mobile) / Email / x@y.com
     """
+    if isinstance(mailto_hrefs, str):
+        mailto_hrefs = [mailto_hrefs]
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
-    def after(heading: str) -> list[str]:
-        for i, line in enumerate(lines):
-            if line.lower() == heading.lower():
-                return lines[i + 1:i + 3]
-        return []
+    emails: list[str] = []
 
-    email = ""
-    if mailto_href and mailto_href.lower().startswith("mailto:"):
-        email = unquote(mailto_href[7:].split("?")[0]).strip()
-    if not email:
-        for line in after("Email"):
-            match = EMAIL_RE.search(line)
-            if match:
-                email = match.group(0)
+    def add_email(value: str) -> None:
+        value = value.strip()
+        if value and value.lower() not in (e.lower() for e in emails):
+            emails.append(value)
+
+    for href in mailto_hrefs or []:
+        if href and href.lower().startswith("mailto:"):
+            add_email(unquote(href[7:].split("?")[0]))
+    # The box only holds contact details, so anything shaped like an email
+    # address in it is theirs (covers headings worded differently).
+    for match in EMAIL_RE.finditer(text):
+        add_email(match.group(0))
+
+    phones: list[str] = []
+    for i, line in enumerate(lines):
+        if line.lower() != "phone":
+            continue
+        # Every phone-looking line under the heading, until the next section.
+        for following in lines[i + 1:]:
+            candidate = PHONE_LABEL_RE.sub("", following).strip()
+            digits = re.sub(r"\D", "", candidate)
+            if len(digits) < 7 or len(candidate) > 40 or EMAIL_RE.search(candidate):
                 break
-    if not email:
-        # Heading worded differently? The box only holds contact details, so
-        # anything shaped like an email address in it is theirs.
-        match = EMAIL_RE.search(text)
-        if match:
-            email = match.group(0)
+            if digits not in (re.sub(r"\D", "", p) for p in phones):
+                phones.append(candidate)
+        break
 
-    phone = ""
-    for line in after("Phone"):
-        candidate = PHONE_LABEL_RE.sub("", line).strip()
-        if len(re.sub(r"\D", "", candidate)) >= 7:
-            phone = candidate
-            break
-
-    return ContactInfo(email=email, phone=phone)
+    return ContactInfo(emails=emails, phones=phones)
 
 
 class LinkedInPage:
@@ -126,12 +136,12 @@ class LinkedInPage:
 
         try:
             text = dialog.inner_text(timeout=self.timeout_ms)
-            mailto = dialog.locator('a[href^="mailto:"]').first
-            href = mailto.get_attribute("href", timeout=1_000) if mailto.count() else None
+            hrefs = dialog.locator('a[href^="mailto:"]').evaluate_all(
+                "links => links.map(a => a.getAttribute('href'))")
         except PlaywrightError as exc:
             raise LinkedInError(f"Couldn't read LinkedIn's Contact info: {_short(exc)}") from exc
 
-        info = parse_contact_info(text, href)
+        info = parse_contact_info(text, hrefs)
         info.dialog_text = text
         if not (info.email or info.phone):
             info.note = "no email or phone shared on LinkedIn"

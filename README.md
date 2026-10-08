@@ -1,23 +1,44 @@
 # Chrome-Teal-Contacts-RPA
 
-Teal has no bulk import for contacts. This tool reads your spreadsheet and, for each
-row, opens Teal's **Contact Tracker** (`app.tealhq.com/contact-tracker`), clicks
-**+ Add a New Contact**, fills in the form from the spreadsheet and clicks
-**Save Contact**. The spreadsheet is the source of truth.
+Teal has no bulk import for contacts. This tool takes your spreadsheet (one row per
+contact, e.g. a Teal contact export) and builds each contact in Teal completely,
+then checks Teal against the spreadsheet. The spreadsheet is the source of truth.
 
-For each contact it:
+It works in two passes:
 
-1. If **Email** or **Phone** is blank in the spreadsheet, opens the person's
-   LinkedIn **Contact info** (`<profile>/overlay/contact-info/`) and uses the email
-   and phone shown there. What it finds is written back into the spreadsheet.
-   LinkedIn only shows these when the person shares them with you (mostly
-   1st-degree connections), so blanks are normal. With `--ask-missing` it then
-   asks you in the terminal for anything still blank (Enter skips).
-2. Fills First Name, Last Name, Job Title, Company Name, Email, LinkedIn, Phone
-   (plus Location and Twitter if your sheet has them) and checks each value stuck.
-3. Pauses so you can look at the form in Chrome, then saves it when you press Enter.
-   Use `--auto-save` to skip the pause once you trust it.
-4. Records the result, so the next run skips contacts that are already done.
+**Pass 1 - LinkedIn (this is where it asks you things).** For each contact with a
+blank Email or Phone, it opens their LinkedIn **Contact info**
+(`<profile>/overlay/contact-info/`):
+
+- one email / one phone found: used as-is;
+- several phone numbers (or emails): it lists them and you pick one;
+- neither an email nor a phone found anywhere: it asks you to type them (Enter skips).
+
+Everything found or typed is written into the spreadsheet. Then it pauses so you
+can look the spreadsheet over before anything goes into Teal.
+
+**Pass 2 - Teal (runs on its own).** For each contact it:
+
+1. Finds the contact in Teal if it's already there (by LinkedIn URL) and updates it,
+   or creates it with **+ Add a New Contact** (name, title, company, email,
+   LinkedIn, phone).
+2. Writes Teal's ID for the contact (the part after `/contact-tracker/` in the
+   address bar) into the spreadsheet's `teal_contact_id` column right away, so a
+   re-run always reopens the same contact and never makes a duplicate.
+3. Opens the contact and sets **Relationship**, **Goal**, **Status** and
+   **Follow up** (and **Last contacted** if your sheet has it). Teal saves these by
+   itself; there's no Save button.
+4. Reloads the contact and checks every field against the spreadsheet: name,
+   title/company, email, phone, LinkedIn, the dropdowns and the dates. Anything
+   that differs is fixed (dropdowns/dates on the page, the rest through **Edit**)
+   and checked again.
+5. Writes the result to the spreadsheet's `rpa_status` column: `done` when
+   everything matches, or `needs attention` with the details in `rpa_notes`. It
+   only stops to ask you when something still doesn't match after fixing.
+
+Formatting differences don't count as mismatches: `(203) 555-0100` matches
+`203-555-0100`, `Co-Worker` matches Teal's `Co-worker`, `10/16/2026` matches
+`2026-10-16`. Blank spreadsheet cells are left alone in Teal.
 
 ## One-time setup (Windows)
 
@@ -97,51 +118,68 @@ Your spreadsheet can live anywhere; pass its full path (tip: in File Explorer,
 Shift + right-click the file, **Copy as path**, then paste).
 
 ```powershell
-# See what would happen; doesn't open Chrome
+# See what would happen (and spot problems in the sheet); doesn't open Chrome
 python teal_contacts.py "C:\Users\benew\OneDrive\AI Projects\Chrome Teal Contact RPA\Uploads\Upload 1.xlsx" --check
+
+# Walk through everything without saving anything
+python teal_contacts.py "C:\Users\benew\OneDrive\AI Projects\Chrome Teal Contact RPA\Uploads\Upload 1.xlsx" --dry-run
 
 # First real try: one contact
 python teal_contacts.py "C:\Users\benew\OneDrive\AI Projects\Chrome Teal Contact RPA\Uploads\Upload 1.xlsx" --limit 1
 
-# Everything that's left, reviewing each before it saves
+# Everything that's left
 python teal_contacts.py "C:\Users\benew\OneDrive\AI Projects\Chrome Teal Contact RPA\Uploads\Upload 1.xlsx"
 ```
 
-At the review pause: **Enter** saves, **s** skips this contact (it's retried next
-run), **q** stops the run (this contact stays pending). You can also correct a
-field in Chrome before pressing Enter. **Ctrl+C** stops at any point.
+**Close the spreadsheet in Excel while the tool runs**, so it can write into it
+(at the pause between the passes you can open it, look, and close it again; the
+Teal pass re-reads it, so your edits count). If the file is locked (open in Excel,
+or OneDrive still syncing), the tool retries briefly, then keeps the values in its
+progress file and writes them on a later run.
 
-**Close the spreadsheet in Excel while the tool runs**, so it can write the
-emails/phones it finds (or you type) back into it. If it's open, the tool tells you and keeps
-the values in its progress file instead.
+When a contact still doesn't match after the tool's fixes, it shows what differs:
+**Enter** leaves it marked `needs attention`, **r** lets the tool try again,
+**c** re-checks after you've fixed it yourself in Chrome. **Ctrl+C** stops at any
+point; a re-run carries on where it left off.
 
 | Option | What it does |
 |---|---|
 | `--check` | Validate the spreadsheet and list pending contacts; no browser |
+| `--dry-run` | Do both passes without saving anything in Teal or the spreadsheet; lists what would change |
 | `--limit N` | Process at most N pending contacts this run |
-| `--auto-save` | Save without the review pause |
-| `--no-linkedin` | Don't look up blank Email/Phone on LinkedIn |
-| `--ask-missing` | Ask in the terminal for Email/Phone still blank after LinkedIn |
-| `--dry-run` | Do everything except Save: fill each form, then click Cancel. Records nothing |
-| `--reset` | Forget all progress and start over (doesn't touch Teal) |
+| `--linkedin-only` | Only pass 1: find emails/phones and write them to the sheet |
+| `--teal-only` | Only pass 2: don't visit LinkedIn |
+| `--yes` | Don't pause between the passes |
+| `--unattended` | Never pause in pass 2; mismatches are just marked `needs attention` |
+| `--review` | Pause before saving each new contact so you can look at the form |
+| `--reset` | Forget all progress and start over (doesn't touch Teal or the sheet) |
 | `--sheet NAME` | Use this worksheet instead of the first one |
-| `--delay SECONDS` | Pause between contacts (default 4, plus up to 50% random) |
-| `--retries N` | Retries when Teal's page or form doesn't load (default 2, with backoff) |
-| `--timeout SECONDS` | How long to wait for Teal's page and form (default 20) |
+| `--delay SECONDS` | Pause between LinkedIn lookups (default 4, plus up to 50% random) |
+| `--retries N` | Retries when a Teal page or form doesn't load (default 2, with backoff) |
+| `--timeout SECONDS` | How long to wait for Teal's and LinkedIn's pages (default 20) |
 | `--chrome-path PATH` | Location of `chrome.exe` if it isn't found automatically |
 | `--profile-dir PATH` | Use a different Chrome profile folder for the tool |
 
+### What it changes in your spreadsheet
+
+- **Email Address / Phone**: filled in from LinkedIn or what you type (never
+  overwritten if already filled).
+- New columns, added at the end the first time: **teal_contact_id**,
+  **rpa_status** (`done`, `needs attention`, `failed`, `skipped`) and **rpa_notes**
+  (what didn't match, or why it failed).
+
 ### What it creates next to your spreadsheet
 
-- `contacts.xlsx.status.json`: progress (done / failed / skipped per contact, with
-  the reason, any email/phone found or typed, and whether LinkedIn was already
-  checked, so a retried row doesn't visit LinkedIn again). Delete it, or use `--reset`, to
-  start over.
+- `Upload 1.xlsx.status.json`: progress per contact (status, reason, Teal ID,
+  email/phone found, whether LinkedIn was already checked). Re-runs skip `done`
+  contacts and retry the rest. Delete it, or use `--reset`, to start over.
 - `logs\teal_contacts-<date>-<time>.log`: everything each run did.
-- `failures\row-<N>.png`: a screenshot of Chrome whenever a row fails.
+- `failures\row-<N>.png`: a screenshot of Chrome when a row fails or needs attention.
+- `failures\linkedin-row-<N>.txt` / `.png`: what LinkedIn showed when no email or
+  phone was found.
 
-At the end of a run you get a summary: how many succeeded, failed (with reasons)
-and were skipped.
+At the end of a run you get a summary: what LinkedIn found, and how many contacts
+are done, need attention, failed or were skipped (with reasons).
 
 ## Spreadsheet format
 
@@ -155,21 +193,28 @@ layout works as-is. Headers are matched case-insensitively:
 | Last name | `Last Name` | yes |
 | Job title | `Position`, `Title`, `Job Title` | yes |
 | Company | `Company` | yes |
-| Email | `Email Address`, `Email` | no (looked up on LinkedIn if blank) |
-| Phone | `Phone`, `Phone Number` | no (looked up on LinkedIn if blank) |
+| Email | `Email Address`, `Email` | no (LinkedIn / asked if blank) |
+| Phone | `Phone`, `Phone Number` | no (LinkedIn / asked if blank) |
+| Relationship | `contact_relationship_type`, `Relationship` | no |
+| Goal | `contact_intention_type`, `Goal` | no |
+| Status | `contact_next_step_type`, `Status` | no |
+| Follow up | `follow_up_at`, `Follow up` | no |
+| Last contacted | `last_contacted_at`, `Last contacted` | no |
 | Location | `Location` | no |
 | Twitter | `twitter_handle`, `Twitter` | no |
 
-Example row:
+- **Dropdown values** can be Teal's export format (`{"name":"Mentor","id":"7"}`)
+  or plain text (`Mentor`). They must be one of Teal's options (case doesn't
+  matter): Relationship: Self, Co-worker, Friend, Family, Other, Recruiter, Mentor,
+  Hiring manager, Alumni. Goal: Networking, Informational interview, Request
+  referral, Research interviewer, Research career. Status: To be contacted, Follow
+  up needed, Meeting scheduled, Thank you sent. `--check` flags anything else.
+- **Dates** can be Excel dates, `2026-10-16` or `10/16/2026`.
+- **Repeated columns** (Teal's export has the three dropdown columns twice): the
+  first non-empty value is used; if the copies disagree the row gets a note.
 
-| First Name | Last Name | Email Address | Phone | Position | Company | URL |
-|---|---|---|---|---|---|---|
-| Jane | Example | jane@example.com | 555-010-1234 | VP Engineering | Acme Corp | https://www.linkedin.com/in/jane-example |
-
-Other columns are ignored for now (they're for a later version that fills in
-relationship, goal, status and follow-up after the contact is saved). Rows with a
-missing or non-LinkedIn URL, or the same URL as an earlier row, are listed and
-skipped. See `examples/sample_contacts.csv`.
+Rows with a missing or non-LinkedIn URL, or the same URL as an earlier row, are
+listed and skipped. See `examples/sample_contacts.csv`.
 
 ## Troubleshooting
 
@@ -184,14 +229,13 @@ Chrome windows and run again. Your normal Chrome windows are fine to leave open.
 window and press Enter in the terminal.
 
 **"LinkedIn: no email or phone shared on LinkedIn"**: usually normal; the person
-hasn't shared them with you. The contact is still created. Use `--ask-missing` to
-type them in yourself. If you know they do share an email, look at
-`failures\linkedin-row-<N>.txt` and `.png`: they show exactly what the tool saw in
-LinkedIn's Contact info box.
+hasn't shared them with you, so the tool asks you instead. If you know they do
+share an email, look at `failures\linkedin-row-<N>.txt` and `.png`: they show
+exactly what the tool saw in LinkedIn's Contact info box.
 
 **"LinkedIn's Contact info box didn't appear"**: LinkedIn was slow, showed a
-security check, or changed its page. The contact is still created without
-email/phone. If it happens every time, open one `.../overlay/contact-info/` link in
+security check, or changed its page. The tool asks you for the email/phone instead
+and tries LinkedIn again on the next run if you skip. If it happens every time, open one `.../overlay/contact-info/` link in
 the tool's Chrome window to see what LinkedIn shows.
 
 **Go easy on LinkedIn**: LinkedIn limits how many profiles you can view and may
@@ -214,12 +258,34 @@ field's placeholder text (the grey hint inside the empty box). Update it in
 may or may not have been created, so check Teal before re-running that row; fix
 the spreadsheet cell, then re-run (failed rows are retried automatically).
 
-**"Can't write to contacts.xlsx - is it open in Excel?"**: close it in Excel. The
-values you typed are kept in the `.status.json` file and used on the next run.
+**"Can't write to Upload 1.xlsx - is it open in Excel (or still syncing)?"**: close
+it in Excel. The values are kept in the `.status.json` file and written on the next run.
 
-**Duplicate contacts in Teal**: the tool only knows what it did itself. If you
-delete or `--reset` the `.status.json` file, contacts already in Teal will be added
-again.
+**"needs attention: Status: Teal shows ..., sheet has ..."**: the tool set the field
+but Teal shows something else after reloading. Fix it in Teal (or the sheet) and
+re-run; the contact is reopened by its ID, not created again.
+
+**"... isn't one of Teal's options"**: the spreadsheet has a dropdown value Teal
+doesn't offer (a typo, or Teal renamed an option). Fix the cell and re-run. If Teal
+added or renamed options, also update `CHOICE_OPTIONS` in `teal_rpa/teal.py` (only
+used by `--check`).
+
+**"Saved, but couldn't find the new contact in Teal's list"**: the contact was
+created but the tool couldn't work out its ID. Open it in Teal, copy the ID from the
+address bar (after `/contact-tracker/`) into the row's `teal_contact_id` cell and
+re-run.
+
+**"Teal contact <ID> didn't open"**: the contact was deleted in Teal, or the
+`teal_contact_id` cell is wrong. Clear the cell (and `--reset` if needed) to create
+it again.
+
+**Duplicate contacts in Teal**: before creating a contact the tool looks for one
+with the same LinkedIn URL (or the same name with no LinkedIn saved) and updates
+that instead. A contact saved in Teal with a different LinkedIn URL is treated as a
+different person.
+
+**Teal changed its page**: the labels the tool looks for are at the top of
+`teal_rpa/teal.py` (button names, form placeholders, section and field labels).
 
 ## Development
 

@@ -7,8 +7,11 @@ import pytest
 from teal_rpa.spreadsheet import (
     SpreadsheetError,
     SpreadsheetLockedError,
+    choice_name,
+    ensure_columns,
     load_contacts,
     normalize_linkedin_url,
+    parse_date,
     write_back,
 )
 
@@ -58,7 +61,7 @@ def test_loads_teal_export_xlsx(tmp_path):
     assert c.row_number == 2
     assert c.raw["follow_up_at"] == "2026-10-02"
     assert c.is_valid
-    assert any("Duplicate column 'contact_intention_type'" in w for w in sheet.warnings)
+    assert any("'contact_intention_type' appears 2 times" in w for w in sheet.warnings)
 
 
 def test_loads_plain_headers_csv(tmp_path):
@@ -149,5 +152,78 @@ def test_write_back_locked_file(tmp_path, monkeypatch):
         raise PermissionError("in use")
 
     monkeypatch.setattr("teal_rpa.spreadsheet._write_back_csv", locked)
+    monkeypatch.setattr("teal_rpa.spreadsheet.time.sleep", lambda s: None)
     with pytest.raises(SpreadsheetLockedError, match="open in Excel"):
         write_back(sheet, 2, {"email": "a@b.com"})
+
+
+NETWORKING_HEADERS = ["First Name", "Last Name", "Position", "Company", "URL", "follow_up_at",
+                      "contact_relationship_type", "contact_intention_type", "contact_next_step_type",
+                      "contact_relationship_type", "contact_intention_type", "contact_next_step_type"]
+
+
+def test_reads_networking_columns(tmp_path):
+    mentor, networking, follow = ('{"name":"Mentor","id":"7"}', '{"name":"Networking","id":"1"}',
+                                  '{"name":"Follow up needed","id":"2"}')
+    path = make_xlsx(tmp_path / "c.xlsx", NETWORKING_HEADERS, [
+        ["Ed", "Soo Hoo", "CTO", "Lenovo", "https://www.linkedin.com/in/ed",
+         datetime.datetime(2026, 10, 16), mentor, networking, follow, mentor, networking, follow],
+    ])
+    [c] = load_contacts(path).contacts
+    assert (c.relationship, c.goal, c.status, c.follow_up) == \
+        ("Mentor", "Networking", "Follow up needed", "2026-10-16")
+    assert c.warnings == []
+
+
+def test_repeated_columns_first_non_empty_and_conflicts(tmp_path):
+    path = make_xlsx(tmp_path / "c.xlsx", NETWORKING_HEADERS, [
+        ["A", "B", "T", "C", "https://www.linkedin.com/in/a", "10/16/2026",
+         None, "Networking", '{"name":"To be contacted"}', "Friend", "networking", "Thank you sent"],
+    ])
+    [c] = load_contacts(path).contacts
+    assert c.relationship == "Friend"  # first copy blank, second used
+    assert c.goal == "Networking"      # same value, different case: no warning
+    assert c.status == "To be contacted"
+    assert c.follow_up == "2026-10-16"
+    assert c.warnings == ["contact_next_step_type has different values in its repeated "
+                          "columns; using 'To be contacted'"]
+
+
+def test_bad_date_is_a_warning_not_a_problem(tmp_path):
+    path = make_xlsx(tmp_path / "c.xlsx", NETWORKING_HEADERS[:6], [
+        ["A", "B", "T", "C", "https://www.linkedin.com/in/a", "next week"]])
+    [c] = load_contacts(path).contacts
+    assert c.is_valid and c.follow_up == ""
+    assert "isn't a date" in c.warnings[0]
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ('{"name":"Co-Worker","id":"2"}', "Co-Worker"), ("Mentor", "Mentor"), ("", ""),
+    ("{not json", "{not json"),
+])
+def test_choice_name(raw, expected):
+    assert choice_name(raw) == expected
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("2026-10-16", datetime.date(2026, 10, 16)), ("2026-10-16 09:30:00", datetime.date(2026, 10, 16)),
+    ("2026-10-16T09:30:00Z", datetime.date(2026, 10, 16)), ("10/2/2026", datetime.date(2026, 10, 2)),
+    ("", None),
+])
+def test_parse_date(raw, expected):
+    assert parse_date(raw) == expected
+
+
+@pytest.mark.parametrize("make", ["xlsx", "csv"])
+def test_ensure_columns_adds_tool_columns_once(tmp_path, make):
+    headers = ["URL", "First Name", "Last Name", "Title", "Company", "Email"]
+    data = [["https://www.linkedin.com/in/a", "A", "B", "T", "C", ""]]
+    path = (make_xlsx(tmp_path / "c.xlsx", headers, data) if make == "xlsx"
+            else make_csv(tmp_path / "c.csv", headers, data))
+    sheet = load_contacts(path)
+    assert ensure_columns(sheet, ["teal_id", "rpa_status"]) == ["teal_contact_id", "rpa_status"]
+    write_back(sheet, 2, {"teal_id": "abc", "rpa_status": "done"})
+    again = load_contacts(path)
+    assert ensure_columns(again, ["teal_id", "rpa_status"]) == []
+    assert again.contacts[0].teal_id == "abc"
+    assert again.headers[-2:] == ["teal_contact_id", "rpa_status"]

@@ -35,7 +35,8 @@ def test_counts(tmp_path):
     state = RunState(tmp_path / "s.json")
     state.mark("a", DONE)
     state.mark("b", FAILED)
-    assert state.counts(["a", "b", "c"]) == {"pending": 1, "done": 1, "failed": 1, "skipped": 0}
+    assert state.counts(["a", "b", "c"]) == {
+        "pending": 1, "done": 1, "failed": 1, "skipped": 0, "needs attention": 0}
 
 
 def test_reset(tmp_path):

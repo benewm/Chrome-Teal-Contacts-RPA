@@ -1,4 +1,9 @@
-"""Runs the real tool against a local stand-in for Teal's contact tracker.
+"""Runs the real tool against local stand-ins for Teal and LinkedIn.
+
+The Teal stand-in (tests/fake_teal/) mirrors the real screens: the contact
+list with "+ Add a New Contact" (form in an iframe, Save returns to the list),
+and contact pages at /contact-tracker/<id> with dropdown menus, calendar-only
+dates that save by themselves, Contact Information and an Edit form.
 
 Needs Playwright and a Chrome/Chromium binary. Set TEAL_RPA_TEST_CHROME to the
 browser's path if it isn't found automatically; otherwise these tests skip.
@@ -8,24 +13,52 @@ import json
 import os
 import socket
 import threading
+import uuid
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import openpyxl
 import pytest
 
-playwright_sync = pytest.importorskip("playwright.sync_api")
+pytest.importorskip("playwright.sync_api")
 
 from teal_rpa import browser  # noqa: E402
 from teal_rpa.linkedin import LinkedInPage  # noqa: E402
 from teal_rpa.runner import Options, Prompter, Run  # noqa: E402
 from teal_rpa.spreadsheet import load_contacts  # noqa: E402
-from teal_rpa.state import DONE, FAILED, SKIPPED, RunState  # noqa: E402
+from teal_rpa.state import DONE, FAILED, NEEDS_ATTENTION, RunState  # noqa: E402
 from teal_rpa.teal import TealPage  # noqa: E402
 
-from .test_spreadsheet import TEAL_HEADERS, make_xlsx, teal_row  # noqa: E402
-
 FAKE_SITE = Path(__file__).parent / "fake_teal"
+
+# Teal's export layout, repeated columns included.
+HEADERS = ["First Name", "Last Name", "Email Address", "Phone", "Position", "Company", "URL",
+           "follow_up_at", "last_contacted_at",
+           "contact_intention_type", "contact_relationship_type", "contact_next_step_type",
+           "contact_intention_type", "contact_relationship_type", "contact_next_step_type"]
+
+
+def choice(name):
+    return json.dumps({"name": name, "id": "1"}) if name else None
+
+
+def row(first, last, slug, email=None, phone=None, title="CTO", company="Acme",
+        goal=None, relationship=None, status=None, follow_up=None, last_contacted=None):
+    picks = [choice(goal), choice(relationship), choice(status)]
+    return [first, last, email, phone, title, company, f"https://www.linkedin.com/in/{slug}",
+            follow_up, last_contacted, *picks, *picks]
+
+
+def make_xlsx(path, rows):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Upload 1"
+    ws.append(HEADERS)
+    for r in rows:
+        ws.append(r)
+    wb.save(path)
+    return path
 
 
 def _chrome_path():
@@ -42,76 +75,110 @@ CHROME = _chrome_path()
 pytestmark = pytest.mark.skipif(CHROME is None, reason="no Chrome/Chromium available")
 
 
-class FakeTeal:
+class FakeSites:
     def __init__(self):
-        self.saved = []
+        self.reset()
+
+    def reset(self):
+        self.contacts = {}          # Teal: id -> contact
         self.logged_in = True
+        self.json_api = True        # False: Teal's replies aren't JSON (no data for the tool)
+        self.ignore_fields = set()  # Teal: changes to these fields don't stick
+        self.config = {}            # front-end variations (nativeSelect, unlabelledArrows, slowForm)
         self.linkedin_logged_in = True
         self.linkedin_visits = []
-        # slug -> (email, phone) shown in the LinkedIn Contact info overlay
+        # LinkedIn: slug -> (emails, phones) shown in the Contact info overlay
         self.linkedin_profiles = {
-            "edsoohoo": ("ed@lenovo.com", "203-555-0100"),
-            "phoneonly": ("", "+1 (212) 555-0199"),
-            "private": ("", ""),
+            "edsoohoo": (["ed@lenovo.com"], ["203-555-0100"]),
+            "joshreicher": (["josh@usi.com"], ["203-555-0111", "(212) 555-0199"]),
+            "private": ([], []),
         }
 
+    def add_contact(self, **fields):
+        ident = str(uuid.uuid4())
+        contact = {"id": ident, "first_name": "", "last_name": "", "title": "", "company": "",
+                   "email": "", "url": "", "phone": "", "twitter": "", "location": "",
+                   "relationship": "", "goal": "", "status": "", "follow_up": "",
+                   "last_contacted": "", "created": "2026-10-02"}
+        contact.update(fields)
+        self.contacts[ident] = contact
+        return ident
 
-def linkedin_contact_info_html(slug, email, phone):
-    sections = [f"<section><h3>{slug.title()}&#39;s Profile</h3>"
-                f"<a href=\"https://linkedin.com/in/{slug}\">linkedin.com/in/{slug}</a></section>"]
-    if phone:
-        sections.append(f"<section><h3>Phone</h3><ul><li><span>{phone}</span> "
-                        f"<span>(Mobile)</span></li></ul></section>")
+    def by_name(self, first):
+        [match] = [c for c in self.contacts.values() if c["first_name"] == first]
+        return match
+
+
+def linkedin_html(slug, emails, phones):
+    sections = [f"<section><h3>Profile</h3><a href=\"https://linkedin.com/in/{slug}\">"
+                f"linkedin.com/in/{slug}</a></section>"]
+    if phones:
+        items = "".join(f"<li><span>{p}</span> <span>(Mobile)</span></li>" for p in phones)
+        sections.append(f"<section><h3>Phone</h3><ul>{items}</ul></section>")
     sections.append("<section><h3>Address</h3><a href=\"#\">Trumbull, CT</a></section>")
-    if email:
-        sections.append(f"<section><h3>Email</h3><a href=\"mailto:{email}\">{email}</a></section>")
+    if emails:
+        links = "".join(f"<a href=\"mailto:{e}\">{e}</a><br>" for e in emails)
+        sections.append(f"<section><h3>Email</h3>{links}</section>")
     body = json.dumps("".join(sections))
-    # Like LinkedIn: the dialog appears first, its sections a moment later.
     return f"""<!doctype html><html><body><main>Profile page</main>
-<div role="dialog" aria-labelledby="t"><h2 id="t">Contact info</h2><div id="c"></div>
-<button>Edit contact info</button></div>
+<div role="dialog" aria-labelledby="t"><h2 id="t">Contact info</h2><div id="c"></div></div>
 <script>setTimeout(() => {{ document.getElementById("c").innerHTML = {body}; }}, 300);</script>
 </body></html>"""
 
 
-def _handler(fake, *args, **kwargs):
+def _handler(sites, *args, **kwargs):
     class Handler(SimpleHTTPRequestHandler):
+        def _send(self, status, body=b"", content_type="application/json", headers=()):
+            self.send_response(status)
+            if body:
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+            for name, value in headers:
+                self.send_header(name, value)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _json(self, data):
+            kind = "application/json" if sites.json_api else "text/plain"
+            self._send(200, json.dumps(data).encode(), kind)
+
         def do_GET(self):
-            if self.path.startswith("/in/"):
-                slug = self.path.split("/")[2]
-                fake.linkedin_visits.append(self.path)
-                if not fake.linkedin_logged_in:
-                    self.send_response(302)
-                    self.send_header("Location", "/authwall?trk=x")
-                    self.end_headers()
-                    return
-                if slug in fake.linkedin_profiles:
-                    html = linkedin_contact_info_html(slug, *fake.linkedin_profiles[slug])
+            path = self.path.split("?")[0]
+            if path.startswith("/in/"):
+                slug = path.split("/")[2]
+                sites.linkedin_visits.append(path)
+                if not sites.linkedin_logged_in:
+                    return self._send(302, headers=[("Location", "/authwall?trk=x")])
+                if slug in sites.linkedin_profiles:
+                    html = linkedin_html(slug, *sites.linkedin_profiles[slug])
                 else:
-                    html = "<html><body><h1>This page doesn\u2019t exist</h1></body></html>"
-                data = html.encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-                return
-            if self.path.startswith("/authwall"):
+                    html = "<html><body><h1>This page doesn’t exist</h1></body></html>"
+                return self._send(200, html.encode(), "text/html; charset=utf-8")
+            if path.startswith("/authwall"):
                 self.path = "/sign-in.html"
-            if self.path.startswith("/contact-tracker"):
-                if not fake.logged_in:
-                    self.send_response(302)
-                    self.send_header("Location", "/sign-in.html")
-                    self.end_headers()
-                    return
+            elif path == "/config.js":
+                return self._send(200, f"window.FAKE_CONFIG = {json.dumps(sites.config)};".encode(),
+                                  "application/javascript")
+            elif path == "/api/contacts":
+                return self._json({"data": list(sites.contacts.values())})
+            elif path.startswith("/contact-tracker"):
+                if not sites.logged_in:
+                    return self._send(302, headers=[("Location", "/sign-in.html")])
                 self.path = "/contact-tracker.html"
             return super().do_GET()
 
+        def _body(self):
+            return json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+
         def do_POST(self):
-            body = self.rfile.read(int(self.headers["Content-Length"]))
-            fake.saved.append(json.loads(body))
-            self.send_response(204)
-            self.end_headers()
+            ident = sites.add_contact(**self._body())
+            self._json({"data": sites.contacts[ident]})
+
+        def do_PATCH(self):
+            ident = self.path.rstrip("/").rsplit("/", 1)[-1]
+            changes = {k: v for k, v in self._body().items() if k not in sites.ignore_fields}
+            sites.contacts[ident].update(changes)
+            self._json({"data": sites.contacts[ident]})
 
         def log_message(self, *a):
             pass
@@ -126,299 +193,326 @@ def _free_port():
 
 
 @pytest.fixture(scope="module")
-def site():
-    fake = FakeTeal()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), partial(_handler, fake))
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    fake.origin = f"http://127.0.0.1:{server.server_address[1]}"
-    fake.url = f"{fake.origin}/contact-tracker"
-    yield fake
-    server.shutdown()
+def server():
+    sites = FakeSites()
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), partial(_handler, sites))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    sites.origin = f"http://127.0.0.1:{srv.server_address[1]}"
+    sites.url = f"{sites.origin}/contact-tracker"
+    yield sites
+    srv.shutdown()
 
 
 @pytest.fixture(scope="module")
-def chrome_page(site, tmp_path_factory):
+def chrome_context(server, tmp_path_factory):
     from playwright.sync_api import sync_playwright
 
-    port = _free_port()
     endpoint = browser.ensure_chrome(
-        chrome_path=CHROME, profile_dir=tmp_path_factory.mktemp("profile"), port=port,
-        start_url="about:blank",
-        extra_args=["--headless=new", "--no-sandbox", "--disable-gpu"],
-    )
+        chrome_path=CHROME, profile_dir=tmp_path_factory.mktemp("profile"), port=_free_port(),
+        start_url="about:blank", extra_args=["--headless=new", "--no-sandbox", "--disable-gpu"])
     with sync_playwright() as pw:
         b, context = browser.connect(pw, endpoint)
-        page = context.new_page()
-        yield page
+        yield context
         b.close()
 
 
 @pytest.fixture
-def fresh(site, chrome_page):
-    site.saved.clear()
-    site.logged_in = True
-    site.linkedin_logged_in = True
-    site.linkedin_visits.clear()
-    chrome_page.goto("about:blank")
-    return site, chrome_page
+def sites(server, chrome_context):
+    server.reset()
+    yield server
+
+
+@pytest.fixture
+def page(chrome_context):
+    page = chrome_context.new_page()
+    yield page
+    page.close()
 
 
 class ScriptedPrompter(Prompter):
-    def __init__(self, answers):
+    def __init__(self, answers=()):
         self.questions = []
         answers = list(answers)
 
         def fake_input(question):
             self.questions.append(question)
+            if not answers:
+                raise EOFError
             return answers.pop(0)
 
         super().__init__(fake_input)
 
 
-def make_run(tmp_path, site, page, rows, answers=(), linkedin=False, **options):
-    path = make_xlsx(tmp_path / "contacts.xlsx", TEAL_HEADERS, rows)
+def make_run(tmp_path, sites, page, rows, answers=(), linkedin=True, reuse=False, **options):
+    path = tmp_path / "contacts.xlsx"
+    if not reuse:
+        make_xlsx(path, rows)
     sheet = load_contacts(path)
-    run = Run(
+    options.setdefault("unattended", True)
+    return Run(
         sheet=sheet, state=RunState.for_spreadsheet(path),
-        teal=TealPage(page, site.url, timeout_ms=5_000),
-        options=Options(delay=0, backoff=0.1, **options),
+        teal=TealPage(page, sites.url, timeout_ms=5_000),
+        options=Options(linkedin_delay=0, teal_delay=0, backoff=0.1, settle_ms=300, **options),
         prompter=ScriptedPrompter(answers), failures_dir=tmp_path / "failures",
-        linkedin=(LinkedInPage(page.context, timeout_ms=5_000, origin=site.origin)
-                  if linkedin else None),
+        linkedin=LinkedInPage(page.context, timeout_ms=5_000, origin=sites.origin) if linkedin else None,
         sleep=lambda s: None,
     )
-    return run, sheet
 
 
-def test_saves_contacts_and_writes_back_answers(tmp_path, fresh):
-    site, page = fresh
-    run, sheet = make_run(tmp_path, site, page, [
-        teal_row("Ed", "Soo Hoo", "https://www.linkedin.com/in/edsoohoo",
-                 position="WW CTO Global Accounts", company="Lenovo"),
-        teal_row("Jane", "Doe", "https://www.linkedin.com/in/jane", email="jane@x.com",
-                 phone=5550100123),
-    ], answers=["not-an-email", "ed@lenovo.com", "", ""], auto_save=True, ask_missing=True)
+def run_both(run):
+    """Both passes, re-reading the spreadsheet in between like the CLI does."""
+    contacts = [c for c in run.sheet.contacts if c.is_valid and not run.state.is_done(c.key)]
+    assert run.enrich_all(contacts) is not False
+    run.sheet = load_contacts(run.sheet.path)
+    keys = {c.key for c in contacts}
+    run.load_all([c for c in run.sheet.contacts if c.key in keys])
+    return run.summary
 
-    summary = run.run(sheet.contacts)
 
-    assert [c.name for c in summary.done] == ["Ed Soo Hoo", "Jane Doe"]
-    assert site.saved[0] == {
-        "first_name": "Ed", "last_name": "Soo Hoo", "title": "WW CTO Global Accounts",
-        "company": "Lenovo", "email": "ed@lenovo.com",
-        "url": "https://www.linkedin.com/in/edsoohoo", "twitter": "", "location": "",
-        "phone": "",
-    }
-    assert site.saved[1]["phone"] == "(555) 010-0123"  # reformatted by the form, still saved
-    # Asked for Ed's email (rejecting the bad one) and phone; nothing for Jane.
+def sheet_rows(path):
+    ws = openpyxl.load_workbook(path).active
+    headers = [c.value for c in ws[1]]
+    return [dict(zip(headers, (c.value for c in r))) for r in ws.iter_rows(min_row=2)]
+
+
+# -- the whole flow ------------------------------------------------------------
+
+def test_full_flow_creates_and_completes_contacts(tmp_path, sites, page):
+    run = make_run(tmp_path, sites, page, [
+        row("Ed", "Soo Hoo", "edsoohoo", title="WW CTO Global Accounts", company="Lenovo",
+            goal="Networking", relationship="Mentor", status="Follow up needed",
+            follow_up="2027-01-05"),
+        row("Joshua", "Reicher", "joshreicher", goal="Networking", relationship="Co-Worker",
+            status="To be contacted", follow_up="2026-08-30"),
+        row("Pri", "Vate", "private", goal="Request referral", relationship="Friend",
+            status="Meeting scheduled"),
+    ], answers=["2", "pri@x.com", ""])  # Josh: 2nd phone; Pri: typed email, no phone
+
+    summary = run_both(run)
+
+    assert [c.name for c in summary.done] == ["Ed Soo Hoo", "Joshua Reicher", "Pri Vate"]
+    assert len(sites.contacts) == 3
+    ed, josh, pri = sites.by_name("Ed"), sites.by_name("Joshua"), sites.by_name("Pri")
+    assert (ed["email"], ed["phone"]) == ("ed@lenovo.com", "(203) 555-0100")
+    assert (ed["relationship"], ed["goal"], ed["status"], ed["follow_up"]) == \
+        ("Mentor", "Networking", "Follow up needed", "2027-01-05")
+    assert (josh["phone"], josh["email"]) == ("(212) 555-0199", "josh@usi.com")
+    assert josh["relationship"] == "Co-worker"  # Teal's spelling, matched ignoring case
+    assert josh["follow_up"] == "2026-08-30"    # calendar stepped backwards
+    assert (pri["email"], pri["phone"], pri["status"]) == ("pri@x.com", "", "Meeting scheduled")
+    assert pri["follow_up"] == ""
+
+    # Asked: which of Josh's phones, then Pri's email and phone. Nothing else.
     assert len(run.prompter.questions) == 3
-    assert "Ed Soo Hoo (WW CTO Global Accounts @ Lenovo)" in run.prompter.questions[0]
-    assert load_contacts(sheet.path).contacts[0].email == "ed@lenovo.com"
+    assert "Which phone?" in run.prompter.questions[0]
 
-    state = RunState.for_spreadsheet(sheet.path)
-    assert state.is_done("https://www.linkedin.com/in/edsoohoo")
-    assert state.recall("https://www.linkedin.com/in/edsoohoo", "phone_skipped") is True
-
-
-def test_review_pause_skip_and_quit(tmp_path, fresh):
-    site, page = fresh
-    run, sheet = make_run(tmp_path, site, page, [
-        teal_row("A", "One", "https://www.linkedin.com/in/a", email="a@x.com", phone="1"),
-        teal_row("B", "Two", "https://www.linkedin.com/in/b", email="b@x.com", phone="2"),
-        teal_row("C", "Three", "https://www.linkedin.com/in/c", email="c@x.com", phone="3"),
-    ], answers=["", "s", "q"])
-
-    summary = run.run(sheet.contacts)
-
-    assert [c.name for c in summary.done] == ["A One"]
-    assert [c.name for c, _ in summary.skipped] == ["B Two"]
-    assert summary.not_reached == 1
-    assert [s["first_name"] for s in site.saved] == ["A"]
-    assert run.state.status("https://www.linkedin.com/in/b") == SKIPPED
-    assert run.state.status("https://www.linkedin.com/in/c") == "pending"
+    rows = sheet_rows(run.sheet.path)
+    assert [r["Email Address"] for r in rows] == ["ed@lenovo.com", "josh@usi.com", "pri@x.com"]
+    assert [r["Phone"] for r in rows] == ["203-555-0100", "(212) 555-0199", None]
+    assert [r["teal_contact_id"] for r in rows] == [ed["id"], josh["id"], pri["id"]]
+    assert [r["rpa_status"] for r in rows] == [DONE] * 3
+    assert all(run.state.is_done(c.key) for c in run.sheet.contacts)
 
 
-def test_dry_run_never_saves_or_records(tmp_path, fresh):
-    site, page = fresh
-    run, sheet = make_run(tmp_path, site, page, [
-        teal_row("A", "One", "https://www.linkedin.com/in/a", email="a@x.com", phone="1"),
-    ], dry_run=True)
+def test_existing_contact_is_updated_not_duplicated(tmp_path, sites, page):
+    ident = sites.add_contact(first_name="Ed", last_name="Soo Hoo", title="CTO", company="Acme",
+                              url="https://linkedin.com/in/edsoohoo/", email="old@lenovo.com",
+                              relationship="Friend")
+    run = make_run(tmp_path, sites, page, [
+        row("Ed", "Soo Hoo", "edsoohoo", email="esoohoo@lenovo.com", phone="203-555-0100",
+            relationship="Mentor", status="Follow up needed", follow_up="2026-10-16"),
+    ])
 
-    summary = run.run(sheet.contacts)
+    summary = run_both(run)
 
-    assert len(summary.dry_run) == 1
-    assert site.saved == []
-    assert not run.state.path.exists()
+    assert len(summary.done) == 1 and len(sites.contacts) == 1
+    ed = sites.contacts[ident]
+    assert (ed["email"], ed["phone"]) == ("esoohoo@lenovo.com", "(203) 555-0100")  # via Edit form
+    assert (ed["relationship"], ed["status"], ed["follow_up"]) == \
+        ("Mentor", "Follow up needed", "2026-10-16")
+    assert sheet_rows(run.sheet.path)[0]["teal_contact_id"] == ident
+    assert sites.linkedin_visits == []  # email and phone were already in the sheet
 
 
-def test_validation_error_marks_failed_with_screenshot(tmp_path, fresh):
-    site, page = fresh
-    run, sheet = make_run(tmp_path, site, page, [
-        teal_row("Bad", "Email", "https://www.linkedin.com/in/bad", email="invalid@x", phone="1"),
-    ], auto_save=True)
+def test_resume_uses_saved_teal_id(tmp_path, sites, page):
+    # A previous run created the contact, then stopped before finishing it.
+    ident = sites.add_contact(first_name="Ed", last_name="Soo Hoo", title="CTO", company="Acme",
+                              url="https://www.linkedin.com/in/edsoohoo", email="ed@x.com")
+    run = make_run(tmp_path, sites, page, [
+        row("Ed", "Soo Hoo", "edsoohoo", email="ed@x.com", phone="1", status="Thank you sent"),
+    ], linkedin=False)
+    run.state.remember("https://www.linkedin.com/in/edsoohoo", teal_id=ident)
 
-    summary = run.run(sheet.contacts)
+    summary = run_both(run)
 
-    [(contact, reason)] = summary.failed
-    assert "Please enter a valid email" in reason
-    assert "check Teal before re-running" in reason
+    assert len(summary.done) == 1 and len(sites.contacts) == 1
+    assert sites.contacts[ident]["status"] == "Thank you sent"
+
+
+def test_rerun_skips_done_contacts(tmp_path, sites, page):
+    rows = [row("Ed", "Soo Hoo", "edsoohoo", email="ed@x.com", phone="1", goal="Networking")]
+    run = make_run(tmp_path, sites, page, rows, linkedin=False)
+    run_both(run)
+    rerun = make_run(tmp_path, sites, page, rows, linkedin=False, reuse=True)
+    summary = run_both(rerun)
+    assert summary.done == [] and len(sites.contacts) == 1
+
+
+# -- fallbacks and page variations --------------------------------------------
+
+def test_without_teal_data_uses_the_contact_list(tmp_path, sites, page):
+    sites.json_api = False  # the tool can't read Teal's replies; must use the list
+    existing = sites.add_contact(first_name="Joshua", last_name="Reicher",
+                                 url="https://www.linkedin.com/in/joshreicher")
+    sites.add_contact(first_name="Joshua", last_name="Reicher",  # same name, different person
+                      url="https://www.linkedin.com/in/another-josh")
+    run = make_run(tmp_path, sites, page, [
+        row("Ed", "Soo Hoo", "edsoohoo", email="ed@x.com", phone="1", goal="Networking"),
+        row("Joshua", "Reicher", "joshreicher", email="j@x.com", phone="2", status="To be contacted"),
+    ], linkedin=False)
+
+    summary = run_both(run)
+
+    assert len(summary.done) == 2 and len(sites.contacts) == 3
+    assert sites.by_name("Ed")["goal"] == "Networking"
+    assert sites.contacts[existing]["status"] == "To be contacted"
+    assert [r["teal_contact_id"] for r in sheet_rows(run.sheet.path)] == \
+        [sites.by_name("Ed")["id"], existing]
+
+
+def test_standard_dropdowns_and_unlabelled_calendar_arrows(tmp_path, sites, page):
+    sites.config = {"nativeSelect": True, "unlabelledArrows": True}
+    run = make_run(tmp_path, sites, page, [
+        row("Ed", "Soo Hoo", "edsoohoo", email="ed@x.com", phone="1", relationship="hiring MANAGER",
+            follow_up="2026-12-31", last_contacted="2026-09-01"),
+    ], linkedin=False)
+
+    summary = run_both(run)
+
+    assert len(summary.done) == 1
+    ed = sites.by_name("Ed")
+    assert (ed["relationship"], ed["follow_up"], ed["last_contacted"]) == \
+        ("Hiring manager", "2026-12-31", "2026-09-01")
+
+
+# -- things that don't work out -------------------------------------------------
+
+def test_field_that_wont_save_needs_attention(tmp_path, sites, page):
+    sites.ignore_fields = {"status"}
+    run = make_run(tmp_path, sites, page, [
+        row("Ed", "Soo Hoo", "edsoohoo", email="ed@x.com", phone="1", goal="Networking",
+            status="Thank you sent"),
+    ], linkedin=False, unattended=False, answers=["r", ""])  # try again, then leave it
+
+    summary = run_both(run)
+
+    [(contact, reason)] = summary.attention
+    assert "Status: Teal shows '(blank)', sheet has 'Thank you sent'" in reason
+    assert sites.by_name("Ed")["goal"] == "Networking"  # the rest was still done
+    assert len(run.prompter.questions) == 2
+    assert run.state.status(contact.key) == NEEDS_ATTENTION
+    assert sheet_rows(run.sheet.path)[0]["rpa_status"] == NEEDS_ATTENTION
     assert (tmp_path / "failures" / "row-2.png").exists()
+
+    # Next run: retried using the saved ID, never a duplicate.
+    sites.ignore_fields = set()
+    rerun = make_run(tmp_path, sites, page, [], linkedin=False, reuse=True)
+    assert len(run_both(rerun).done) == 1 and len(sites.contacts) == 1
+
+
+def test_value_that_isnt_a_teal_option(tmp_path, sites, page):
+    run = make_run(tmp_path, sites, page, [
+        row("Ed", "Soo Hoo", "edsoohoo", email="ed@x.com", phone="1", relationship="Mentr"),
+    ], linkedin=False)
+
+    [(_, reason)] = run_both(run).attention
+
+    assert "Relationship: 'Mentr' isn't one of Teal's options" in reason
+
+
+def test_add_form_validation_error_fails_row(tmp_path, sites, page):
+    run = make_run(tmp_path, sites, page, [
+        row("Bad", "Email", "bad", email="invalid@x", phone="1"),
+    ], linkedin=False)
+
+    [(_, reason)] = run_both(run).failed
+
+    assert "Please enter a valid email" in reason and "check Teal before re-running" in reason
     assert run.state.status("https://www.linkedin.com/in/bad") == FAILED
 
 
-def test_rerun_skips_done_rows(tmp_path, fresh):
-    site, page = fresh
-    rows = [teal_row("A", "One", "https://www.linkedin.com/in/a", email="a@x.com", phone="1")]
-    run, sheet = make_run(tmp_path, site, page, rows, auto_save=True)
-    run.run(sheet.contacts)
-    assert run.state.status("https://www.linkedin.com/in/a") == DONE
-
-    state = RunState.for_spreadsheet(sheet.path)
-    todo = [c for c in load_contacts(sheet.path).contacts if not state.is_done(c.key)]
-    assert todo == []
-
-
-def test_waits_for_sign_in(tmp_path, fresh):
-    site, page = fresh
-    site.logged_in = False
-    run, sheet = make_run(tmp_path, site, page, [
-        teal_row("A", "One", "https://www.linkedin.com/in/a", email="a@x.com", phone="1"),
-    ], auto_save=True)
-
-    def sign_in(question):
-        site.logged_in = True
-        return ""
-
-    run.prompter = Prompter(sign_in)
-    summary = run.run(sheet.contacts)
-
-    assert len(summary.done) == 1
-
-
-def test_form_that_never_opens_fails_after_retries(tmp_path, fresh, monkeypatch):
-    site, page = fresh
-    run, sheet = make_run(tmp_path, site, page, [
-        teal_row("A", "One", "https://www.linkedin.com/in/a", email="a@x.com", phone="1"),
-    ], auto_save=True)
-    run.teal.tracker_url = site.url + "?slow=1"
-    run.teal.timeout_ms = 1_000  # the form takes 1.5s to open, so it "never" shows
+def test_form_that_never_opens_fails_after_retries(tmp_path, sites, page, monkeypatch):
+    sites.config = {"slowForm": True}
+    run = make_run(tmp_path, sites, page, [
+        row("Ed", "Soo Hoo", "edsoohoo", email="ed@x.com", phone="1"),
+    ], linkedin=False)
+    run.teal.timeout_ms = 1_000  # the form takes 1.5s, so it "never" shows
     attempts = []
     original = run.teal.open_form
     monkeypatch.setattr(run.teal, "open_form", lambda: attempts.append(1) or original())
 
-    summary = run.run(sheet.contacts)
+    [(_, reason)] = run_both(run).failed
 
     assert len(attempts) == 3  # first try + 2 retries
-    [(_, reason)] = summary.failed
-    assert "didn't appear" in reason
-    assert site.saved == []
+    assert "didn't appear" in reason and sites.contacts == {}
 
 
-def test_input_closing_stops_cleanly(tmp_path, fresh):
-    site, page = fresh
-    run, sheet = make_run(tmp_path, site, page, [
-        teal_row("A", "One", "https://www.linkedin.com/in/a", email="a@x.com", phone="1"),
-        teal_row("B", "Two", "https://www.linkedin.com/in/b", email="b@x.com", phone="2"),
-    ], answers=[""])  # saves A, then input runs out at B's review
+def test_dry_run_changes_nothing(tmp_path, sites, page):
+    ident = sites.add_contact(first_name="Ed", last_name="Soo Hoo",
+                              url="https://www.linkedin.com/in/edsoohoo", relationship="Friend")
+    run = make_run(tmp_path, sites, page, [
+        row("Ed", "Soo Hoo", "edsoohoo", relationship="Mentor"),
+        row("Joshua", "Reicher", "joshreicher", email="j@x.com", phone="2"),
+    ], answers=[""], dry_run=True)  # Ed's LinkedIn has one phone and one email: no question
 
-    def scripted(question, answers=[""]):
-        if not answers:
-            raise EOFError
-        return answers.pop()
+    summary = run_both(run)
 
-    run.prompter = Prompter(scripted)
-    summary = run.run(sheet.contacts)
-
-    assert [c.name for c in summary.done] == ["A One"]
-    assert summary.not_reached == 1
-    assert run.state.status("https://www.linkedin.com/in/b") == "pending"
+    assert len(summary.dry_run) == 2
+    assert "Relationship" in summary.dry_run[0][1]
+    assert list(sites.contacts) == [ident] and sites.contacts[ident]["relationship"] == "Friend"
+    assert sheet_rows(run.sheet.path)[0]["Email Address"] is None
+    assert not run.state.path.exists()
 
 
-def test_linkedin_fills_blank_email_and_phone(tmp_path, fresh):
-    site, page = fresh
-    run, sheet = make_run(tmp_path, site, page, [
-        teal_row("Ed", "Soo Hoo", "https://www.linkedin.com/in/edsoohoo"),
-        teal_row("Pho", "Ne", "https://www.linkedin.com/in/phoneonly"),
-        teal_row("Pri", "Vate", "https://www.linkedin.com/in/private"),
-        teal_row("Has", "Both", "https://www.linkedin.com/in/hasboth", email="sheet@x.com", phone="1"),
-    ], linkedin=True, auto_save=True)
+# -- LinkedIn and sign-in ------------------------------------------------------
 
-    summary = run.run(sheet.contacts)
+def test_nothing_on_linkedin_saves_evidence_and_asks_once(tmp_path, sites, page):
+    rows = [row("Pri", "Vate", "private"), row("Gone", "Away", "no-such-person")]
+    run = make_run(tmp_path, sites, page, rows, answers=["", "", "", ""])
 
-    assert len(summary.done) == 4
-    by_name = {s["first_name"]: s for s in site.saved}
-    # (the stand-in form reformats 10-digit numbers, like many real forms)
-    assert (by_name["Ed"]["email"], by_name["Ed"]["phone"]) == ("ed@lenovo.com", "(203) 555-0100")
-    assert (by_name["Pho"]["email"], by_name["Pho"]["phone"]) == ("", "+1 (212) 555-0199")
-    assert (by_name["Pri"]["email"], by_name["Pri"]["phone"]) == ("", "")
-    # The spreadsheet wins: no LinkedIn visit when nothing is blank.
-    assert not any("hasboth" in v for v in site.linkedin_visits)
-    assert all(v.endswith("/overlay/contact-info/") for v in site.linkedin_visits)
-    assert run.prompter.questions == []  # nothing asked without --ask-missing
-    # Found values are written back to the spreadsheet.
-    reloaded = load_contacts(sheet.path).contacts
-    assert (reloaded[0].email, reloaded[0].phone) == ("ed@lenovo.com", "203-555-0100")
-    assert reloaded[1].phone == "+1 (212) 555-0199"
+    run.enrich_all(run.sheet.contacts)
+
+    assert len(run.prompter.questions) == 4  # email + phone, for each
+    assert (tmp_path / "failures" / "linkedin-row-2.txt").exists()
+    assert "doesn't exist" in (tmp_path / "failures" / "linkedin-row-3.txt").read_text()
+    assert run.summary.nothing == ["Pri Vate", "Gone Away"]
+
+    visits = len(sites.linkedin_visits)
+    run.enrich_all(load_contacts(run.sheet.path).contacts)  # already handled: no revisit
+    assert len(sites.linkedin_visits) == visits
 
 
-def test_linkedin_then_ask_for_what_is_still_missing(tmp_path, fresh):
-    site, page = fresh
-    run, sheet = make_run(tmp_path, site, page, [
-        teal_row("Pho", "Ne", "https://www.linkedin.com/in/phoneonly"),
-    ], answers=["typed@x.com"], linkedin=True, auto_save=True, ask_missing=True)
-
-    run.run(sheet.contacts)
-
-    assert len(run.prompter.questions) == 1 and "Email" in run.prompter.questions[0]
-    assert (site.saved[0]["email"], site.saved[0]["phone"]) == ("typed@x.com", "+1 (212) 555-0199")
-
-
-def test_linkedin_missing_profile_still_creates_contact(tmp_path, fresh):
-    site, page = fresh
-    run, sheet = make_run(tmp_path, site, page, [
-        teal_row("Gone", "Away", "https://www.linkedin.com/in/no-such-person"),
-    ], linkedin=True, auto_save=True)
-
-    summary = run.run(sheet.contacts)
-
-    assert len(summary.done) == 1
-    assert site.saved[0]["email"] == ""
-    evidence = (tmp_path / "failures" / "linkedin-row-2.txt").read_text()
-    assert "doesn't exist" in evidence
-    assert (tmp_path / "failures" / "linkedin-row-2.png").exists()
-
-
-def test_linkedin_sign_in_prompt(tmp_path, fresh):
-    site, page = fresh
-    site.linkedin_logged_in = False
-    run, sheet = make_run(tmp_path, site, page, [
-        teal_row("Ed", "Soo Hoo", "https://www.linkedin.com/in/edsoohoo"),
-    ], linkedin=True, auto_save=True)
+def test_waits_for_sign_in_to_linkedin_and_teal(tmp_path, sites, page):
+    sites.logged_in = sites.linkedin_logged_in = False
+    run = make_run(tmp_path, sites, page, [row("Ed", "Soo Hoo", "edsoohoo")])
     questions = []
 
     def sign_in(question):
         questions.append(question)
-        site.linkedin_logged_in = True
+        if "LinkedIn" in question:
+            sites.linkedin_logged_in = True
+        else:
+            sites.logged_in = True
         return ""
 
     run.prompter = Prompter(sign_in)
-    summary = run.run(sheet.contacts)
+    summary = run_both(run)
 
-    assert "Sign in to LinkedIn" in questions[0]
+    assert "Sign in to LinkedIn" in questions[0] and "Sign in to Teal" in questions[1]
     assert len(summary.done) == 1
-    assert site.saved[0]["email"] == "ed@lenovo.com"
 
 
-def test_linkedin_checked_once_per_contact(tmp_path, fresh):
-    site, page = fresh
-    rows = [teal_row("Pri", "Vate", "https://www.linkedin.com/in/private")]
-    run, sheet = make_run(tmp_path, site, page, rows, linkedin=True, dry_run=True)
-    run.run(sheet.contacts)
-    run.run(sheet.contacts)
-    assert len(site.linkedin_visits) == 2  # dry runs don't record anything
-
-    run, sheet = make_run(tmp_path, site, page, rows, linkedin=True, answers=["s"])
-    run.run(sheet.contacts)  # skipped at review, so the row stays retryable
-    run.prompter = ScriptedPrompter([""])
-    run.run(sheet.contacts)
-    assert len(site.linkedin_visits) == 3  # but LinkedIn isn't looked up again
-    assert run.state.is_done("https://www.linkedin.com/in/private")
+def test_input_closing_stops_cleanly(tmp_path, sites, page):
+    run = make_run(tmp_path, sites, page, [row("Pri", "Vate", "private")], answers=[])
+    assert run.enrich_all(run.sheet.contacts) is False
+    assert run.state.status("https://www.linkedin.com/in/private") == "pending"

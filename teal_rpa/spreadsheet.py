@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import csv
+import json
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -11,7 +13,7 @@ from urllib.parse import urlsplit
 
 # Canonical field -> accepted header names (matched case-insensitively).
 # Covers both the plain names ("LinkedIn URL", "Title") and Teal's export
-# names ("URL", "Position", "Email Address").
+# names ("URL", "Position", "Email Address", "contact_relationship_type").
 COLUMN_ALIASES: dict[str, list[str]] = {
     "url": ["LinkedIn URL", "URL", "Link", "LinkedIn", "Profile URL"],
     "first_name": ["First Name", "FirstName"],
@@ -22,9 +24,20 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     "phone": ["Phone", "Phone Number", "Mobile"],
     "location": ["Location"],
     "twitter": ["Twitter", "twitter_handle", "Twitter Handle"],
+    "relationship": ["contact_relationship_type", "Relationship"],
+    "goal": ["contact_intention_type", "Goal"],
+    "status": ["contact_next_step_type", "Status"],
+    "follow_up": ["follow_up_at", "Follow up", "Follow Up"],
+    "last_contacted": ["last_contacted_at", "Last contacted", "Last Contacted"],
+    "teal_id": ["teal_contact_id", "Teal ID"],
+    "rpa_status": ["rpa_status"],
+    "rpa_notes": ["rpa_notes"],
 }
 REQUIRED_FIELDS = ["url", "first_name", "last_name", "title", "company"]
-OPTIONAL_FIELDS = ["email", "phone", "location", "twitter"]
+DATE_FIELDS = ["follow_up", "last_contacted"]
+CHOICE_FIELDS = ["relationship", "goal", "status"]
+# Columns the tool adds to the sheet if they're missing: field -> header.
+TOOL_COLUMNS = {"teal_id": "teal_contact_id", "rpa_status": "rpa_status", "rpa_notes": "rpa_notes"}
 
 LINKEDIN_PROFILE_RE = re.compile(r"^https://www\.linkedin\.com/in/[^/]+$")
 
@@ -49,8 +62,15 @@ class Contact:
     phone: str
     location: str = ""
     twitter: str = ""
+    relationship: str = ""
+    goal: str = ""
+    status: str = ""
+    follow_up: str = ""       # ISO date (YYYY-MM-DD) or ""
+    last_contacted: str = ""  # ISO date (YYYY-MM-DD) or ""
+    teal_id: str = ""
     raw: dict[str, str] = field(default_factory=dict)
-    problems: list[str] = field(default_factory=list)
+    problems: list[str] = field(default_factory=list)  # row can't be processed
+    warnings: list[str] = field(default_factory=list)  # processed, but worth a look
 
     @property
     def name(self) -> str:
@@ -93,6 +113,34 @@ def normalize_linkedin_url(value: str) -> str:
     return f"https://{host}{path}"
 
 
+def choice_name(value: str) -> str:
+    """Teal exports dropdown values as {"name":"Mentor","id":"7"}; plain text works too."""
+    value = value.strip()
+    if value.startswith("{"):
+        try:
+            data = json.loads(value)
+        except ValueError:
+            return value
+        if isinstance(data, dict):
+            return str(data.get("name") or "").strip()
+    return value
+
+
+def parse_date(value: str) -> date | None:
+    """Accepts 2026-10-16, 2026-10-16 09:30:00, 2026-10-16T09:30:00Z, 10/16/2026."""
+    value = value.strip()
+    if not value:
+        return None
+    match = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", value)
+    if match:
+        return date(*map(int, match.groups()))
+    match = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", value)
+    if match:
+        month, day, year = map(int, match.groups())
+        return date(year, month, day)
+    raise ValueError(f"not a date: {value!r}")
+
+
 def _cell_to_str(value) -> str:
     if value is None:
         return ""
@@ -106,23 +154,21 @@ def _cell_to_str(value) -> str:
     return str(value).strip()
 
 
-def _map_columns(headers: list[str]) -> tuple[dict[str, int], list[str]]:
-    lookup: dict[str, int] = {}
-    warnings: list[str] = []
+def _map_columns(headers: list[str]) -> tuple[dict[str, int], dict[str, list[int]], list[str]]:
+    """Returns (field -> first column, field -> all columns with that header, warnings)."""
+    lookup: dict[str, list[int]] = {}
     for index, header in enumerate(headers):
         norm = header.strip().lower()
-        if not norm:
-            continue
-        if norm in lookup:
-            warnings.append(f"Duplicate column '{header}' (column {index + 1}); using the first one.")
-            continue
-        lookup[norm] = index
+        if norm:
+            lookup.setdefault(norm, []).append(index)
 
     column_map: dict[str, int] = {}
+    all_columns: dict[str, list[int]] = {}
     for canonical, aliases in COLUMN_ALIASES.items():
         for alias in aliases:
             if alias.lower() in lookup:
-                column_map[canonical] = lookup[alias.lower()]
+                all_columns[canonical] = lookup[alias.lower()]
+                column_map[canonical] = all_columns[canonical][0]
                 break
 
     missing = [f for f in REQUIRED_FIELDS if f not in column_map]
@@ -131,7 +177,14 @@ def _map_columns(headers: list[str]) -> tuple[dict[str, int], list[str]]:
         raise SpreadsheetError(
             f"Missing required column(s) -> {wanted}. Found headers: {[h for h in headers if h]}"
         )
-    return column_map, warnings
+
+    warnings = []
+    for norm, indexes in lookup.items():
+        if len(indexes) > 1:
+            columns = ", ".join(str(i + 1) for i in indexes)
+            warnings.append(f"Column '{headers[indexes[0]]}' appears {len(indexes)} times "
+                            f"(columns {columns}); using the first non-empty value.")
+    return column_map, all_columns, warnings
 
 
 def _read_rows(path: Path, sheet_name: str | None) -> tuple[list[list], str | None]:
@@ -173,7 +226,7 @@ def load_contacts(path: str | Path, sheet_name: str | None = None) -> Sheet:
         raise SpreadsheetError(f"{path} is empty.")
 
     headers = [_cell_to_str(h) for h in rows[0]]
-    column_map, warnings = _map_columns(headers)
+    column_map, all_columns, warnings = _map_columns(headers)
 
     contacts: list[Contact] = []
     seen_urls: dict[str, int] = {}
@@ -183,14 +236,22 @@ def load_contacts(path: str | Path, sheet_name: str | None = None) -> Sheet:
         if not any(cells):
             continue  # blank line
         cells += [""] * (len(headers) - len(cells))
+        row_warnings: list[str] = []
 
         def get(name: str) -> str:
-            idx = column_map.get(name)
-            return cells[idx] if idx is not None else ""
+            values = [cells[i] for i in all_columns.get(name, [])]
+            filled = [v for v in values if v]
+            if not filled:
+                return ""
+            compare = choice_name if name in CHOICE_FIELDS else str
+            if len({compare(v).lower() for v in filled}) > 1:
+                row_warnings.append(f"{headers[all_columns[name][0]]} has different values "
+                                    f"in its repeated columns; using {compare(filled[0])!r}")
+            return filled[0]
 
         raw = {}
         for h, v in zip(headers, cells):
-            if h and h not in raw:
+            if h and not raw.get(h):
                 raw[h] = v
 
         url = normalize_linkedin_url(get("url"))
@@ -205,8 +266,21 @@ def load_contacts(path: str | Path, sheet_name: str | None = None) -> Sheet:
             phone=get("phone"),
             location=get("location"),
             twitter=get("twitter"),
+            teal_id=get("teal_id"),
             raw=raw,
         )
+        for name in CHOICE_FIELDS:
+            setattr(contact, name, choice_name(get(name)))
+        for name in DATE_FIELDS:
+            value = get(name)
+            try:
+                parsed = parse_date(value)
+            except ValueError:
+                row_warnings.append(f"{name.replace('_', ' ')} {value!r} isn't a date; ignoring it")
+                parsed = None
+            setattr(contact, name, parsed.isoformat() if parsed else "")
+        contact.warnings = row_warnings
+
         if not url:
             contact.problems.append("missing LinkedIn URL")
         elif not LINKEDIN_PROFILE_RE.match(url):
@@ -222,27 +296,70 @@ def load_contacts(path: str | Path, sheet_name: str | None = None) -> Sheet:
     return Sheet(path, actual_sheet, headers, column_map, contacts, warnings)
 
 
+def _with_lock_retry(action, path: Path, attempts: int = 4, wait: float = 1.5):
+    # OneDrive and Excel hold the file briefly while syncing/saving.
+    for attempt in range(attempts):
+        try:
+            return action()
+        except PermissionError as exc:
+            if attempt == attempts - 1:
+                raise SpreadsheetLockedError(
+                    f"Can't write to {path.name} - is it open in Excel (or still syncing)? "
+                    "Close it and re-run."
+                ) from exc
+            time.sleep(wait)
+
+
+def ensure_columns(sheet: Sheet, fields: list[str]) -> list[str]:
+    """Add the tool's own columns (e.g. teal_contact_id) to the header row if
+    they're missing. Returns the headers added."""
+    missing = [f for f in fields if f not in sheet.column_map]
+    if not missing:
+        return []
+    start = len(sheet.headers)
+    while start > 0 and not sheet.headers[start - 1]:
+        start -= 1  # reuse trailing blank header cells
+    new_headers = {start + i: TOOL_COLUMNS[f] for i, f in enumerate(missing)}
+
+    def add():
+        if sheet.path.suffix.lower() == ".csv":
+            rows, encoding = _read_csv(sheet.path)
+            header = rows[0] + [""] * (start + len(missing) - len(rows[0]))
+            for index, name in new_headers.items():
+                header[index] = name
+            rows[0] = header
+            with sheet.path.open("w", newline="", encoding=encoding) as f:
+                csv.writer(f).writerows(rows)
+        else:
+            _write_xlsx_cells(sheet.path, sheet.sheet_name, 1, new_headers)
+
+    _with_lock_retry(add, sheet.path)
+    for index, name in new_headers.items():
+        if index >= len(sheet.headers):
+            sheet.headers += [""] * (index + 1 - len(sheet.headers))
+        sheet.headers[index] = name
+    for i, f in enumerate(missing):
+        sheet.column_map[f] = start + i
+    return list(new_headers.values())
+
+
 def write_back(sheet: Sheet, row_number: int, values: dict[str, str]) -> None:
     """Write canonical fields (e.g. {"email": ..., "phone": ...}) into a row.
 
     Columns that don't exist in the sheet are skipped. Raises
-    SpreadsheetLockedError if the file is open elsewhere (Excel locks it).
+    SpreadsheetLockedError if the file stays locked (open in Excel, syncing).
     """
     updates = {sheet.column_map[k]: v for k, v in values.items() if k in sheet.column_map}
     if not updates:
         return
-    try:
-        if sheet.path.suffix.lower() == ".csv":
-            _write_back_csv(sheet.path, row_number, updates)
-        else:
-            _write_back_xlsx(sheet.path, sheet.sheet_name, row_number, updates)
-    except PermissionError as exc:
-        raise SpreadsheetLockedError(
-            f"Can't write to {sheet.path.name} - is it open in Excel? Close it and re-run."
-        ) from exc
+    if sheet.path.suffix.lower() == ".csv":
+        _with_lock_retry(lambda: _write_back_csv(sheet.path, row_number, updates), sheet.path)
+    else:
+        _with_lock_retry(lambda: _write_xlsx_cells(sheet.path, sheet.sheet_name, row_number, updates),
+                         sheet.path)
 
 
-def _write_back_xlsx(path: Path, sheet_name: str | None, row_number: int, updates: dict[int, str]) -> None:
+def _write_xlsx_cells(path: Path, sheet_name: str | None, row_number: int, updates: dict[int, str]) -> None:
     import openpyxl
 
     wb = openpyxl.load_workbook(path)

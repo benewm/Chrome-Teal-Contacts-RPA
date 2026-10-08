@@ -15,7 +15,8 @@ PENDING = "pending"
 DONE = "done"
 FAILED = "failed"
 SKIPPED = "skipped"
-STATUSES = (PENDING, DONE, FAILED, SKIPPED)
+NEEDS_ATTENTION = "needs attention"  # in Teal, but some fields don't match the sheet
+STATUSES = (PENDING, DONE, FAILED, SKIPPED, NEEDS_ATTENTION)
 
 SCHEMA_VERSION = 1
 

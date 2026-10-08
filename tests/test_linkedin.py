@@ -47,3 +47,13 @@ def test_contact_info_url():
 def test_email_anywhere_in_box_when_heading_differs():
     text = "Contact info\nJosh's Profile\nlinkedin.com/in/joshreicher\nEmail address\njosh@example.com"
     assert parse_contact_info(text).email == "josh@example.com"
+
+
+def test_several_phones_and_emails():
+    text = ("Contact info\nJosh's Profile\nlinkedin.com/in/joshreicher\n"
+            "Phone\n203-555-0100 (Mobile)\n(212) 555-0199 (Work)\n203.555.0100 (Home)\n"
+            "Address\nTrumbull, CT\nEmail\njosh@work.com\nWebsites\nexample.com")
+    info = parse_contact_info(text, ["mailto:josh@home.com", "mailto:JOSH@work.com"])
+    assert info.phones == ["203-555-0100", "(212) 555-0199"]  # a repeated number is listed once
+    assert info.emails == ["josh@home.com", "JOSH@work.com"]
+    assert (info.email, info.phone) == ("josh@home.com", "203-555-0100")

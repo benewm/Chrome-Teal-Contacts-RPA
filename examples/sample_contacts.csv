@@ -1,3 +1,3 @@
-First Name,Last Name,Email Address,Phone,Position,Company,URL
-Jane,Example,jane@example.com,555-010-1234,VP Engineering,Acme Corp,https://www.linkedin.com/in/jane-example
-John,Sample,,,Head of Data,Globex,https://www.linkedin.com/in/john-sample
+First Name,Last Name,Email Address,Phone,Position,Company,URL,contact_relationship_type,contact_intention_type,contact_next_step_type,follow_up_at
+Jane,Example,jane@example.com,555-010-1234,VP Engineering,Acme Corp,https://www.linkedin.com/in/jane-example,Mentor,Networking,Follow up needed,10/16/2026
+John,Sample,,,Head of Data,Globex,https://www.linkedin.com/in/john-sample,Recruiter,Informational interview,To be contacted,
