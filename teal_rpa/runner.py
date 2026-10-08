@@ -261,6 +261,7 @@ class Run:
                     raise UserQuit() from exc
             except LinkedInError as exc:
                 say(f"    LinkedIn: {exc}.")
+                self.save_linkedin_evidence(contact, ContactInfo(note=str(exc)))
                 return None
         return None
 

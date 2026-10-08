@@ -87,6 +87,8 @@ class FakeSites:
         self.config = {}            # front-end variations (nativeSelect, unlabelledArrows, slowForm)
         self.linkedin_logged_in = True
         self.linkedin_visits = []
+        # Profiles where the overlay link lands on the plain profile page (no box).
+        self.linkedin_lands_on_profile = set()
         # LinkedIn: slug -> (emails, phones) shown in the Contact info overlay
         self.linkedin_profiles = {
             "edsoohoo": (["ed@lenovo.com"], ["203-555-0100"]),
@@ -109,6 +111,19 @@ class FakeSites:
         return match
 
 
+def linkedin_profile_html(slug, emails, phones):
+    """The profile page; its "Contact info" link opens the box without reloading."""
+    # "</" escaped so the embedded </script> doesn't end this page's script early.
+    box = json.dumps(linkedin_html(slug, emails, phones).split("<!--box-->")[1]).replace("</", "<\\/")
+    return f"""<!doctype html><html><body><main><h1>{slug}</h1>
+<a id="ci" href="/in/{slug}/overlay/contact-info/">Contact info</a></main><div id="box"></div>
+<script>document.getElementById("ci").addEventListener("click", (e) => {{
+  e.preventDefault(); history.pushState({{}}, "", e.currentTarget.href);
+  document.getElementById("box").innerHTML = {box};
+  for (const s of document.querySelectorAll("#box script")) eval(s.textContent);
+}});</script></body></html>"""
+
+
 def linkedin_html(slug, emails, phones):
     sections = [f"<section><h3>Profile</h3><a href=\"https://linkedin.com/in/{slug}\">"
                 f"linkedin.com/in/{slug}</a></section>"]
@@ -120,9 +135,9 @@ def linkedin_html(slug, emails, phones):
         links = "".join(f"<a href=\"mailto:{e}\">{e}</a><br>" for e in emails)
         sections.append(f"<section><h3>Email</h3>{links}</section>")
     body = json.dumps("".join(sections))
-    return f"""<!doctype html><html><body><main>Profile page</main>
+    return f"""<!doctype html><html><body><main>Profile page</main><!--box-->
 <div role="dialog" aria-labelledby="t"><h2 id="t">Contact info</h2><div id="c"></div></div>
-<script>setTimeout(() => {{ document.getElementById("c").innerHTML = {body}; }}, 300);</script>
+<script>setTimeout(() => {{ document.getElementById("c").innerHTML = {body}; }}, 300);</script><!--box-->
 </body></html>"""
 
 
@@ -149,8 +164,12 @@ def _handler(sites, *args, **kwargs):
                 sites.linkedin_visits.append(path)
                 if not sites.linkedin_logged_in:
                     return self._send(302, headers=[("Location", "/authwall?trk=x")])
+                overlay = path.rstrip("/").endswith("/overlay/contact-info")
+                if overlay and slug in sites.linkedin_lands_on_profile:
+                    return self._send(302, headers=[("Location", f"/in/{slug}/")])
                 if slug in sites.linkedin_profiles:
-                    html = linkedin_html(slug, *sites.linkedin_profiles[slug])
+                    make = linkedin_html if overlay else linkedin_profile_html
+                    html = make(slug, *sites.linkedin_profiles[slug])
                 else:
                     html = "<html><body><h1>This page doesn’t exist</h1></body></html>"
                 return self._send(200, html.encode(), "text/html; charset=utf-8")
@@ -516,3 +535,46 @@ def test_input_closing_stops_cleanly(tmp_path, sites, page):
     run = make_run(tmp_path, sites, page, [row("Pri", "Vate", "private")], answers=[])
     assert run.enrich_all(run.sheet.contacts) is False
     assert run.state.status("https://www.linkedin.com/in/private") == "pending"
+
+
+def test_linkedin_landing_on_profile_opens_contact_info(tmp_path, sites, page):
+    sites.linkedin_lands_on_profile = {"joshreicher"}
+    run = make_run(tmp_path, sites, page, [row("Joshua", "Reicher", "joshreicher")],
+                   answers=["1"])
+
+    run.enrich_all(run.sheet.contacts)
+
+    assert run.summary.found == ["Joshua Reicher: email, phone"]
+    assert run.state.recall("https://www.linkedin.com/in/joshreicher", "email") == "josh@usi.com"
+    assert sites.linkedin_visits == ["/in/joshreicher/overlay/contact-info/", "/in/joshreicher/"]
+
+
+def test_linkedin_box_for_someone_else_is_rejected(tmp_path, sites, page, monkeypatch):
+    import tests.test_end_to_end as module
+    from teal_rpa.linkedin import LinkedInError
+
+    run = make_run(tmp_path, sites, page, [row("Ed", "Soo Hoo", "edsoohoo")])
+    assert run.linkedin.lookup("https://www.linkedin.com/in/edsoohoo").email == "ed@lenovo.com"
+
+    real_html = module.linkedin_html
+    monkeypatch.setattr(module, "linkedin_html",
+                        lambda slug, emails, phones: real_html("someone-else", emails, phones))
+    with pytest.raises(LinkedInError, match="is for /in/someone-else"):
+        run.linkedin.lookup("https://www.linkedin.com/in/edsoohoo")
+
+
+def test_linkedin_error_keeps_evidence(tmp_path, sites, page):
+    sites.linkedin_profiles["broken"] = ([], [])
+    sites.linkedin_lands_on_profile = {"broken"}
+    run = make_run(tmp_path, sites, page, [row("Bro", "Ken", "broken")], answers=["", ""])
+    run.linkedin.timeout_ms = 1_000
+
+    def no_link(page):  # the profile's Contact info link can't be found either
+        pass
+
+    run.linkedin._click_contact_info_link = no_link
+    run.enrich_all(run.sheet.contacts)
+
+    evidence = (tmp_path / "failures" / "linkedin-row-2.txt").read_text()
+    assert "didn't appear (the tab shows" in evidence and "/in/broken/" in evidence
+    assert (tmp_path / "failures" / "linkedin-row-2.png").exists()

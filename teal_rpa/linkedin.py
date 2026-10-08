@@ -111,6 +111,7 @@ class LinkedInPage:
     def lookup(self, profile_url: str) -> ContactInfo:
         page = self.page
         url = contact_info_url(profile_url, self.origin)
+        slug = _slug(profile_url)
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
         except PlaywrightError as exc:
@@ -119,20 +120,32 @@ class LinkedInPage:
 
         dialog = page.get_by_role("dialog").filter(has_text=DIALOG_TITLE).first
         try:
-            dialog.wait_for(state="visible", timeout=self.timeout_ms)
-        except PlaywrightError as exc:
+            dialog.wait_for(state="visible", timeout=min(self.timeout_ms, 8_000))
+        except PlaywrightError:
+            # LinkedIn sometimes shows the profile without opening the Contact
+            # info box; open it with the profile's own "Contact info" link.
             self._check_signed_in(page)
             if NOT_FOUND_TEXT.search(_body_text(page)):
                 return ContactInfo(note="LinkedIn says this profile doesn't exist")
-            raise LinkedInError("LinkedIn's Contact info box didn't appear") from exc
+            self._click_contact_info_link(page)
+            try:
+                dialog.wait_for(state="visible", timeout=self.timeout_ms)
+            except PlaywrightError as exc:
+                self._check_signed_in(page)
+                raise LinkedInError(
+                    f"LinkedIn's Contact info box didn't appear (the tab shows {page.url})") from exc
 
-        # Sections fill in after the dialog opens; the profile link is always
-        # there, so once it shows the rest has loaded too.
+        # Sections fill in after the box opens. The person's own profile link is
+        # always in it: once it shows, the rest has loaded, and it proves the box
+        # belongs to this person and not someone else.
+        own_link = dialog.get_by_text(re.compile(rf"linkedin\.com/in/{re.escape(slug)}/?\s*$", re.I))
         try:
-            dialog.get_by_text(re.compile(r"linkedin\.com/in/", re.I)).first.wait_for(
-                state="visible", timeout=5_000)
+            own_link.first.wait_for(state="visible", timeout=5_000)
         except PlaywrightError:
-            pass
+            shown = re.findall(r"linkedin\.com/in/([^/\s]+)", _inner_text(dialog), re.I)
+            if shown and all(s.casefold() != slug.casefold() for s in shown):
+                raise LinkedInError(f"LinkedIn's Contact info box is for /in/{shown[0]}, "
+                                    f"not /in/{slug}") from None
 
         try:
             text = dialog.inner_text(timeout=self.timeout_ms)
@@ -147,9 +160,30 @@ class LinkedInPage:
             info.note = "no email or phone shared on LinkedIn"
         return info
 
+    def _click_contact_info_link(self, page: Page) -> None:
+        for link in (page.locator('a[href*="/overlay/contact-info"]'),
+                     page.get_by_role("link", name=re.compile(r"^\s*contact info\s*$", re.I))):
+            try:
+                if link.count():
+                    link.first.click(timeout=self.timeout_ms)
+                    return
+            except PlaywrightError:
+                continue
+
     def _check_signed_in(self, page: Page) -> None:
         if any(marker in page.url for marker in LOGIN_URL_MARKERS):
             raise LinkedInLoginRequired("LinkedIn wants you to sign in")
+
+
+def _slug(profile_url: str) -> str:
+    return unquote(profile_url.split("/in/", 1)[-1].strip("/").split("/")[0])
+
+
+def _inner_text(locator) -> str:
+    try:
+        return locator.inner_text(timeout=2_000)
+    except PlaywrightError:
+        return ""
 
 
 def _body_text(page: Page) -> str:

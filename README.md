@@ -233,8 +233,14 @@ hasn't shared them with you, so the tool asks you instead. If you know they do
 share an email, look at `failures\linkedin-row-<N>.txt` and `.png`: they show
 exactly what the tool saw in LinkedIn's Contact info box.
 
-**"LinkedIn's Contact info box didn't appear"**: LinkedIn was slow, showed a
-security check, or changed its page. The tool asks you for the email/phone instead
+**LinkedIn shows the profile instead of the Contact info box**: LinkedIn sometimes
+opens `.../overlay/contact-info/` as the plain profile page. The tool then clicks
+the profile's own **Contact info** link to open the box. It also checks that the
+box shows this person's profile link, so it never takes details from someone else.
+
+**"LinkedIn's Contact info box didn't appear (the tab shows ...)"**: neither the
+link nor the click opened the box: LinkedIn was slow, showed a security check, or
+changed its page. `failures\linkedin-row-<N>.txt` / `.png` show what the tab had. The tool asks you for the email/phone instead
 and tries LinkedIn again on the next run if you skip. If it happens every time, open one `.../overlay/contact-info/` link in
 the tool's Chrome window to see what LinkedIn shows.
 
