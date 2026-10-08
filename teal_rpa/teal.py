@@ -70,9 +70,19 @@ CHOICE_OPTIONS = {
 
 MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August",
           "September", "October", "November", "December"]
-MONTH_CAPTION = re.compile(rf"^\s*({'|'.join(MONTHS)})\s+(\d{{4}})\s*$")
+MONTH_YEAR = re.compile(rf"\b({'|'.join(MONTHS)})\s+(\d{{4}})\b", re.I)
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 ID_KEYS = ("id", "uuid", "contact_id", "contactId", "_id")
+
+
+# Is this calendar day a faded one from the month before/after? Checks whole
+# class names (day-outside, rdp-outside, outside): shadcn puts styling classes
+# such as "[&:has([aria-selected].day-outside)]:bg-accent/50" on every day, so
+# a mere substring match would rule out every day.
+OUTSIDE_DAY_JS = """e => [e, e.parentElement].some(n => n && (
+    [...n.classList].some(c => /^(rdp-)?(day[-_])?outside$/i.test(c))
+    || n.dataset?.outside === 'true'
+    || n.getAttribute('aria-disabled') === 'true' || n.disabled === true))"""
 
 
 class TealError(Exception):
@@ -136,6 +146,7 @@ class TealPage:
         self.tracker_url = tracker_url.rstrip("/")
         self.timeout_ms = timeout_ms
         self.known: list[dict] = []          # objects with ids seen in Teal's responses
+        self.debug_dir: Path | None = None   # where to keep HTML of misbehaving widgets
         self._responses: list[Response] = []
         page.on("response", self._on_response)
 
@@ -506,68 +517,115 @@ class TealPage:
             raise TealError(f"Couldn't set {label}: {_short(exc)}") from exc
 
     def set_date(self, field: str, iso: str) -> None:
-        """Pick a date in a calendar-only date field."""
+        """Pick a date in a calendar-only date field.
+
+        The field is a button ("Add a date" or MM/DD/YYYY) that opens a calendar
+        popup; the button's aria-controls names the popup, so everything below
+        looks only inside it.
+        """
         section, label = DATE_FIELDS[field]
         target = date.fromisoformat(iso)
+        control = self._control(section, label)
+        popup = None
         try:
-            self._control(section, label).click(timeout=self.timeout_ms)
-            caption = self.page.get_by_text(MONTH_CAPTION).first
-            caption.wait_for(state="visible", timeout=self.timeout_ms)
-            calendar = caption.locator(
-                "xpath=ancestor::*[descendant::table or descendant::*[@role='grid']][1]")
+            control.click(timeout=self.timeout_ms)
+            popup = self._calendar_popup(control)
             for _ in range(240):  # up to 20 years either way
-                month_name, year = MONTH_CAPTION.match(caption.inner_text()).groups()
-                shown = (int(year), MONTHS.index(month_name) + 1)
+                shown = self._shown_month(popup)
                 steps = (target.year - shown[0]) * 12 + target.month - shown[1]
                 if steps == 0:
                     break
-                self._month_button(calendar, forward=steps > 0).click(timeout=self.timeout_ms)
-                self._wait_caption_change(caption, shown)
+                self._month_button(popup, forward=steps > 0).click(timeout=self.timeout_ms)
+                self._wait_month_change(popup, shown)
             else:
                 raise TealError(f"Couldn't reach {target:%B %Y} in the {label} calendar")
-            self._day_button(calendar, target.day).click(timeout=self.timeout_ms)
+            self._day_button(popup, target).click(timeout=self.timeout_ms)
             self.page.wait_for_timeout(300)
-            if caption.is_visible():
+            if popup.is_visible():
                 self.page.keyboard.press("Escape")
-        except PlaywrightError as exc:
+        except (PlaywrightError, TealError) as exc:
+            self._save_debug_html(f"calendar-{field}", popup)
             self.page.keyboard.press("Escape")
+            if isinstance(exc, TealError):
+                raise
             raise TealError(f"Couldn't set {label}: {_short(exc)}") from exc
 
-    def _month_button(self, calendar: Locator, forward: bool) -> Locator:
-        named = calendar.get_by_role(
-            "button", name=re.compile(r"next" if forward else r"prev", re.I))
+    def _calendar_popup(self, control: Locator) -> Locator:
+        popup_id = control.get_attribute("aria-controls", timeout=self.timeout_ms)
+        if popup_id:
+            popup = self.page.locator(f'[id="{popup_id}"]')
+        else:  # no link to the popup: the open dialog that has a calendar grid
+            popup = self.page.locator("[role=dialog]").filter(
+                has=self.page.locator("table, [role=grid]")).last
+        popup.locator("table, [role=grid]").first.wait_for(state="visible", timeout=self.timeout_ms)
+        return popup
+
+    def _shown_month(self, popup: Locator) -> tuple[int, int]:
+        # The month heading ("October 2026") is the first month name in the popup.
+        text = popup.inner_text(timeout=self.timeout_ms)
+        found = MONTH_YEAR.search(text)
+        if not found:
+            raise TealError("Couldn't tell which month the calendar shows")
+        return int(found.group(2)), MONTHS.index(found.group(1).title()) + 1
+
+    def _month_button(self, popup: Locator, forward: bool) -> Locator:
+        named = popup.get_by_role("button", name=re.compile(r"next" if forward else r"prev", re.I))
         if named.count():
             return named.first
         # Unlabelled arrow buttons: the icon-only ones, previous then next.
-        icons = [b for b in calendar.locator("button").all() if not b.inner_text().strip()]
+        icons = [b for b in popup.locator("button").all() if not b.inner_text().strip()]
         if len(icons) < 2:
             raise TealError("Couldn't find the calendar's month arrows")
         return icons[-1] if forward else icons[0]
 
-    def _wait_caption_change(self, caption: Locator, shown: tuple[int, int]) -> None:
+    def _wait_month_change(self, popup: Locator, shown: tuple[int, int]) -> None:
         for _ in range(40):
-            text = caption.inner_text()
-            month_name, year = MONTH_CAPTION.match(text).groups()
-            if (int(year), MONTHS.index(month_name) + 1) != shown:
+            if self._shown_month(popup) != shown:
                 return
             self.page.wait_for_timeout(50)
 
-    def _day_button(self, calendar: Locator, day: int) -> Locator:
-        candidates = calendar.locator("button, [role=gridcell]").filter(
-            has_text=re.compile(rf"^\s*{day}\s*$"))
-        # Skip the faded days from the months either side.
+    def _day_button(self, popup: Locator, target: date) -> Locator:
+        # Newer calendars label each day with its date; use that when present.
+        for selector in (f'[data-day="{target.isoformat()}"]',
+                         f'[data-day="{target.month}/{target.day}/{target.year}"]',
+                         f'[data-day="{target:%m/%d/%Y}"]'):
+            cell = popup.locator(selector)
+            if cell.count():
+                button = cell.first.locator("button")
+                return button.first if button.count() else cell.first
+        labelled = popup.locator("button[aria-label]").all()
+        month = MONTHS[target.month - 1]
+        pattern = re.compile(rf"\b{month}\s+{target.day}(st|nd|rd|th)?\b.*\b{target.year}\b", re.I)
+        for button in labelled:
+            if pattern.search(button.get_attribute("aria-label") or ""):
+                return button
+
+        # Otherwise by the number shown, skipping the faded days of the months
+        # either side.
+        candidates = popup.locator("button, [role=gridcell]").filter(
+            has_text=re.compile(rf"^\s*{target.day}\s*$"))
         inside = []
         for i in range(candidates.count()):
             cell = candidates.nth(i)
-            outside = cell.evaluate(
-                "e => [e, e.parentElement].some(n => n && (/outside/i.test(n.className || '')"
-                " || n.dataset?.outside === 'true' || n.getAttribute('aria-disabled') === 'true'))")
+            outside = cell.evaluate(OUTSIDE_DAY_JS)
             if not outside:
                 inside.append(cell)
         if not inside:
-            raise TealError(f"Couldn't find day {day} in the calendar")
+            raise TealError(f"Couldn't find day {target.day} in the calendar")
         # If outside days can't be told apart: early days come first, late days last.
-        return inside[0] if day < 15 else inside[-1]
+        return inside[0] if target.day < 15 else inside[-1]
+
+    def _save_debug_html(self, name: str, locator: Locator | None) -> None:
+        """Keep the HTML of a part of the page that didn't behave, for diagnosis."""
+        if not self.debug_dir:
+            return
+        try:
+            html = locator.evaluate("e => e.outerHTML") if locator is not None and locator.count() \
+                else self.page.content()
+            self.debug_dir.mkdir(parents=True, exist_ok=True)
+            (self.debug_dir / f"{name}-{int(time.time())}.html").write_text(html, encoding="utf-8")
+        except Exception:
+            pass
 
     def settle(self, ms: int = 1500) -> None:
         """Give Teal time to save changes made on the page (it saves by itself)."""

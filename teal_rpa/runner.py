@@ -167,6 +167,9 @@ class Run:
     sleep: Callable[[float], None] = time.sleep
     summary: Summary = field(default_factory=Summary)
 
+    def __post_init__(self):
+        self.teal.debug_dir = self.failures_dir
+
     # -- shared helpers -------------------------------------------------------
 
     def contact_value(self, contact: Contact, field: str) -> str:

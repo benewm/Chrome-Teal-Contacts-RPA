@@ -414,7 +414,34 @@ def test_standard_dropdowns_and_unlabelled_calendar_arrows(tmp_path, sites, page
         ("Hiring manager", "2026-12-31", "2026-09-01")
 
 
+def test_newer_calendar_markup(tmp_path, sites, page):
+    sites.config = {"calendarV9": True}
+    run = make_run(tmp_path, sites, page, [
+        row("Ed", "Soo Hoo", "edsoohoo", email="ed@x.com", phone="1",
+            follow_up="2026-10-10", last_contacted="2027-02-28"),
+    ], linkedin=False)
+
+    summary = run_both(run)
+
+    assert len(summary.done) == 1
+    ed = sites.by_name("Ed")
+    assert (ed["follow_up"], ed["last_contacted"]) == ("2026-10-10", "2027-02-28")
+
+
 # -- things that don't work out -------------------------------------------------
+
+def test_calendar_problem_keeps_its_html(tmp_path, sites, page):
+    sites.config = {"disabledDays": True}
+    run = make_run(tmp_path, sites, page, [
+        row("Ed", "Soo Hoo", "edsoohoo", email="ed@x.com", phone="1", follow_up="2026-10-10"),
+    ], linkedin=False, retries=0)
+
+    [(_, reason)] = run_both(run).failed
+
+    assert "Couldn't find day 10 in the calendar" in reason
+    [saved] = (tmp_path / "failures").glob("calendar-follow_up-*.html")
+    assert "October 2026" in saved.read_text() and 'role="grid"' in saved.read_text()
+
 
 def test_field_that_wont_save_needs_attention(tmp_path, sites, page):
     sites.ignore_fields = {"status"}

@@ -281,6 +281,11 @@ created but the tool couldn't work out its ID. Open it in Teal, copy the ID from
 address bar (after `/contact-tracker/`) into the row's `teal_contact_id` cell and
 re-run.
 
+**"Couldn't find day N in the calendar" / "Couldn't set Follow up"**: the Follow up
+or Last contacted calendar didn't behave as expected. The calendar's HTML is saved
+as `failures\calendar-follow_up-<number>.html` (with a screenshot `row-<N>.png`);
+send those along when reporting it.
+
 **"Teal contact <ID> didn't open"**: the contact was deleted in Teal, or the
 `teal_contact_id` cell is wrong. Clear the cell (and `--reset` if needed) to create
 it again.

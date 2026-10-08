@@ -43,7 +43,10 @@ let contacts = [];
 
 const $ = (html) => { const t = document.createElement("template"); t.innerHTML = html.trim(); return t.content.firstChild; };
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
-const fmt = (iso) => { if (!iso) return ""; const [y, m, d] = iso.split("-").map(Number); return `${m}/${d}/${y}`; };
+const fmt = (iso) => { if (!iso) return ""; const [y, m, d] = iso.split("-"); return `${m}/${d}/${y}`; };
+const dateButton = (field, label, iso) => `<div class="w-full lg:w-1/2 xl:w-1/3"><label><div class="h6">${label}</div>
+  <button class="inline-flex items-center gap-2 w-full justify-start text-left font-normal" data-active="false" type="button"
+    aria-haspopup="dialog" aria-expanded="false" aria-controls="radix-_r_${field}_" data-state="closed" data-date="${field}">${ICON}${fmt(iso) || "Add a date"}</button></label></div>`;
 
 async function api(method, path, body) {
   const res = await fetch(path, {method, body: body ? JSON.stringify(body) : undefined});
@@ -97,8 +100,8 @@ function route() {
     </section>
     <section><h2>Dates</h2><button aria-label="Collapse">${ICON}</button>
       <label>Date saved</label><input disabled value="${fmt(c.created)}">
-      <label>Last contacted</label><button type="button" data-date="last_contacted">${ICON}<span>${fmt(c.last_contacted)}</span></button>
-      <label>Follow up</label><button type="button" data-date="follow_up">${ICON}<span>${fmt(c.follow_up)}</span></button>
+      ${dateButton("last_contacted", "Last contacted", c.last_contacted)}
+      ${dateButton("follow_up", "Follow up", c.follow_up)}
     </section>
     <section><h2>Contact Information</h2><button aria-label="Collapse">${ICON}</button>
       <div>Email</div><div>${esc(c.email || "-")}</div>
@@ -106,7 +109,7 @@ function route() {
       <div>Phone Number</div><div>${esc(c.phone || "-")}</div>
       <div>Twitter</div><div>${esc(c.twitter || "-")}</div>
     </section>
-    <section><h2>Work Experience</h2><p>Please save this contact on LinkedIn to save work experience</p></section>`;
+    <section><h2>Work Experience</h2><p>Please save this contact on LinkedIn to save work experience</p><span>October 2026</span></section>`;
   record.querySelector("#edit").addEventListener("click", () => openForm(c.id));
   record.querySelectorAll("[role=combobox]").forEach((b) => b.addEventListener("click", () => openListbox(b, c)));
   record.querySelectorAll("select").forEach((s) => s.addEventListener("change", () => update(c.id, {[s.dataset.field]: s.value})));
@@ -145,33 +148,55 @@ function openCalendar(button, c) {
   const field = button.dataset.date;
   const start = c[field] ? c[field].split("-").map(Number) : [2026, 10, 8];
   let year = start[0], month = start[1] - 1;
-  const pop = $(`<div class="pop" role="dialog"></div>`);
+  // Radix popover: its id is the button's aria-controls.
+  const pop = $(`<div class="pop" role="dialog" id="${button.getAttribute("aria-controls")}"></div>`);
   const label = (text) => CFG.unlabelledArrows ? "" : `aria-label="${text}"`;
+  // shadcn's calendar puts this on EVERY day cell, faded or not.
+  const CELL = "h-9 w-9 text-center text-sm p-0 relative [&:has([aria-selected].day-range-end)]:rounded-r-md "
+    + "[&:has([aria-selected].day-outside)]:bg-accent/50 [&:has([aria-selected])]:bg-accent focus-within:relative";
+  const ORD = (d) => d + (d % 10 === 1 && d !== 11 ? "st" : d % 10 === 2 && d !== 12 ? "nd" : d % 10 === 3 && d !== 13 ? "rd" : "th");
   function draw() {
     const first = new Date(year, month, 1), days = new Date(year, month + 1, 0).getDate();
     const prevDays = new Date(year, month, 0).getDate();
     const cells = [];
-    for (let i = first.getDay(); i > 0; i--) cells.push({d: prevDays - i + 1, out: true});
-    for (let d = 1; d <= days; d++) cells.push({d, out: false});
-    for (let d = 1; cells.length % 7; d++) cells.push({d, out: true});
+    for (let i = first.getDay(); i > 0; i--) cells.push({d: prevDays - i + 1, out: true, m: month - 1});
+    for (let d = 1; d <= days; d++) cells.push({d, out: false, m: month});
+    for (let d = 1; cells.length % 7; d++) cells.push({d, out: true, m: month + 1});
     let rows = "";
     for (let i = 0; i < cells.length; i += 7) {
-      rows += "<tr>" + cells.slice(i, i + 7).map((x) =>
-        `<td class="${x.out ? "outside" : ""}"><button type="button" class="day ${x.out ? "day-outside" : ""}" data-day="${x.out ? "" : x.d}">${x.d}</button></td>`).join("") + "</tr>";
+      rows += '<tr class="flex w-full mt-2">' + cells.slice(i, i + 7).map((x) => {
+        const when = new Date(year, x.m, x.d);
+        const iso = `${when.getFullYear()}-${String(when.getMonth() + 1).padStart(2, "0")}-${String(when.getDate()).padStart(2, "0")}`;
+        const pick = x.out ? "" : x.d;
+        if (CFG.calendarV9) {  // react-day-picker 9: dated, labelled cells
+          const name = `${["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"][when.getDay()]}, ${MONTHS[when.getMonth()]} ${ORD(x.d)}, ${when.getFullYear()}`;
+          return `<td role="gridcell" class="rdp-day ${x.out ? "rdp-outside" : ""} ${CELL}" data-day="${iso}" ${x.out ? 'data-outside="true"' : ""}>`
+            + `<button type="button" class="rdp-day_button" aria-label="${name}" data-pick="${pick}">${x.d}</button></td>`;
+        }
+        // react-day-picker 8 (shadcn): the button is the gridcell; faded days have class day-outside
+        return `<td role="presentation" class="${CELL}"><button name="day" role="gridcell" tabindex="-1" type="button"`
+          + (CFG.disabledDays ? " disabled" : "")
+          + ` class="rdp-button_reset rdp-button inline-flex h-9 w-9 p-0 font-normal ${x.out ? "day-outside text-muted-foreground opacity-50" : ""}"`
+          + ` data-pick="${pick}">${x.d}</button></td>`;
+      }).join("") + "</tr>";
     }
-    pop.innerHTML = `<div><button type="button" class="nav" data-step="-1" ${label("Go to previous month")}>${ICON}</button>
-      <span class="caption">${MONTHS[month]} ${year}</span>
-      <button type="button" class="nav" data-step="1" ${label("Go to next month")}>${ICON}</button></div>
-      <table role="grid"><thead><tr><th>Su</th><th>Mo</th><th>Tu</th><th>We</th><th>Th</th><th>Fr</th><th>Sa</th></tr></thead>
-      <tbody>${rows}</tbody></table>`;
+    const caption = CFG.calendarV9
+      ? `<span class="rdp-caption_label" role="status" aria-live="polite">${MONTHS[month]} ${year}</span>`
+      : `<div class="text-sm font-medium" aria-live="polite" role="presentation">${MONTHS[month]} ${year}</div>`;
+    pop.innerHTML = `<div class="rdp"><div class="space-y-4"><div class="flex justify-center pt-1 relative items-center">${caption}
+      <div class="space-x-1 flex items-center">
+      <button type="button" name="previous-month" class="nav" data-step="-1" ${label("Go to previous month")}>${ICON}</button>
+      <button type="button" name="next-month" class="nav" data-step="1" ${label("Go to next month")}>${ICON}</button></div></div>
+      <table role="grid" class="w-full border-collapse space-y-1"><thead><tr><th>Su</th><th>Mo</th><th>Tu</th><th>We</th><th>Th</th><th>Fr</th><th>Sa</th></tr></thead>
+      <tbody>${rows}</tbody></table></div></div>`;
     pop.querySelectorAll(".nav").forEach((b) => b.addEventListener("click", () => {
       month += Number(b.dataset.step);
       if (month < 0) { month = 11; year--; } if (month > 11) { month = 0; year++; }
       setTimeout(draw, 50);
     }));
-    pop.querySelectorAll("[data-day]").forEach((b) => b.addEventListener("click", () => {
-      if (!b.dataset.day) return;
-      const iso = `${year}-${String(month + 1).padStart(2, "0")}-${String(b.dataset.day).padStart(2, "0")}`;
+    pop.querySelectorAll("[data-pick]").forEach((b) => b.addEventListener("click", () => {
+      if (!b.dataset.pick) return;  // faded days do nothing here
+      const iso = `${year}-${String(month + 1).padStart(2, "0")}-${String(b.dataset.pick).padStart(2, "0")}`;
       closePopups(); update(c.id, {[field]: iso});
     }));
   }
