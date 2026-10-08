@@ -164,6 +164,8 @@ def main(argv=None) -> int:
 
     out_dir = sheet.path.parent
     log_path = setup_logging(out_dir / "logs")
+    from teal_rpa import __version__
+    say(f"Teal contacts tool version {__version__}")
     say(f"{len(todo)} contact(s) to process from {sheet.path.name}. Log: {log_path}")
     if args.dry_run:
         say("Dry run: nothing will be saved in Teal or the spreadsheet.")

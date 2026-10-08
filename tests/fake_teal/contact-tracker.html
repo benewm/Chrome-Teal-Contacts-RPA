@@ -176,7 +176,7 @@ function openCalendar(button, c) {
         // react-day-picker 8 (shadcn): the button is the gridcell; faded days have class day-outside
         return `<td role="presentation" class="${CELL}"><button name="day" role="gridcell" tabindex="-1" type="button"`
           + (CFG.disabledDays ? " disabled" : "")
-          + ` class="rdp-button_reset rdp-button inline-flex h-9 w-9 p-0 font-normal ${x.out ? "day-outside text-muted-foreground opacity-50" : ""}"`
+          + ` class="rdp-button_reset rdp-button inline-flex h-9 w-9 p-0 font-normal ${x.out && !CFG.plainDays ? "day-outside text-muted-foreground opacity-50" : ""}"`
           + ` data-pick="${pick}">${x.d}</button></td>`;
       }).join("") + "</tr>";
     }

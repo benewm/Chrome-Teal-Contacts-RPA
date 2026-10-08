@@ -543,6 +543,11 @@ class TealPage:
             self.page.wait_for_timeout(300)
             if popup.is_visible():
                 self.page.keyboard.press("Escape")
+            # The button should now show the date (MM/DD/YYYY).
+            shown = self.read_date(field)
+            if shown != target.isoformat():
+                raise TealError(f"Clicked {target:%m/%d/%Y} in the {label} calendar, but the "
+                                f"field shows {control.inner_text(timeout=2_000).strip()!r}")
         except (PlaywrightError, TealError) as exc:
             self._save_debug_html(f"calendar-{field}", popup)
             self.page.keyboard.press("Escape")
@@ -600,20 +605,39 @@ class TealPage:
             if pattern.search(button.get_attribute("aria-label") or ""):
                 return button
 
-        # Otherwise by the number shown, skipping the faded days of the months
-        # either side.
+        # Otherwise by position in the month grid. The first "1" in the grid is
+        # always the 1st of the shown month (faded days before it are 23-31, and
+        # the faded days after it come later), so day N is the Nth cell from
+        # there. This needs no knowledge of how the calendar styles its days.
+        cells = self._grid_cells(popup)
+        texts = [_cell_text(c) for c in cells]
+        if "1" in texts:
+            index = texts.index("1") + target.day - 1
+            if index < len(texts) and texts[index] == str(target.day):
+                cell = cells[index]
+                button = cell.locator("button")
+                pick = button.first if button.count() else cell
+                if not pick.is_disabled():
+                    return pick
+
+        # Last resort: by the number shown, skipping days marked as faded.
         candidates = popup.locator("button, [role=gridcell]").filter(
             has_text=re.compile(rf"^\s*{target.day}\s*$"))
-        inside = []
-        for i in range(candidates.count()):
-            cell = candidates.nth(i)
-            outside = cell.evaluate(OUTSIDE_DAY_JS)
-            if not outside:
-                inside.append(cell)
-        if not inside:
-            raise TealError(f"Couldn't find day {target.day} in the calendar")
-        # If outside days can't be told apart: early days come first, late days last.
-        return inside[0] if target.day < 15 else inside[-1]
+        inside = [candidates.nth(i) for i in range(candidates.count())
+                  if not candidates.nth(i).evaluate(OUTSIDE_DAY_JS)]
+        if inside:
+            # If faded days can't be told apart: early days come first, late days last.
+            return inside[0] if target.day < 15 else inside[-1]
+        shown = " ".join(texts) or "no day cells"
+        raise TealError(f"Couldn't find day {target.day} in the calendar (it shows: {shown})")
+
+    def _grid_cells(self, popup: Locator) -> list[Locator]:
+        """The calendar's day cells, in order (one per day, never doubled)."""
+        for selector in ("table tbody td", "[role=grid] [role=gridcell]", "[role=grid] button"):
+            cells = popup.locator(selector)
+            if cells.count():
+                return [cells.nth(i) for i in range(cells.count())]
+        return []
 
     def _save_debug_html(self, name: str, locator: Locator | None) -> None:
         """Keep the HTML of a part of the page that didn't behave, for diagnosis."""
@@ -638,6 +662,13 @@ class TealPage:
             return path
         except PlaywrightError:
             return None
+
+
+def _cell_text(cell: Locator) -> str:
+    try:
+        return cell.inner_text(timeout=2_000).strip()
+    except PlaywrightError:
+        return ""
 
 
 def _short(exc: Exception) -> str:

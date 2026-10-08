@@ -428,6 +428,20 @@ def test_newer_calendar_markup(tmp_path, sites, page):
     assert (ed["follow_up"], ed["last_contacted"]) == ("2026-10-10", "2027-02-28")
 
 
+def test_calendar_days_without_any_markings(tmp_path, sites, page):
+    sites.config = {"plainDays": True}  # faded days look like any other day
+    run = make_run(tmp_path, sites, page, [
+        row("Ed", "Soo Hoo", "edsoohoo", email="ed@x.com", phone="1",
+            follow_up="2026-10-10", last_contacted="2026-11-30"),
+    ], linkedin=False)
+
+    summary = run_both(run)
+
+    assert len(summary.done) == 1
+    ed = sites.by_name("Ed")
+    assert (ed["follow_up"], ed["last_contacted"]) == ("2026-10-10", "2026-11-30")
+
+
 # -- things that don't work out -------------------------------------------------
 
 def test_calendar_problem_keeps_its_html(tmp_path, sites, page):
@@ -438,7 +452,7 @@ def test_calendar_problem_keeps_its_html(tmp_path, sites, page):
 
     [(_, reason)] = run_both(run).failed
 
-    assert "Couldn't find day 10 in the calendar" in reason
+    assert "Couldn't find day 10 in the calendar (it shows: 27 28 29 30 1 2 3" in reason
     [saved] = (tmp_path / "failures").glob("calendar-follow_up-*.html")
     assert "October 2026" in saved.read_text() and 'role="grid"' in saved.read_text()
 
