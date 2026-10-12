@@ -18,6 +18,7 @@ import re
 import time
 from datetime import date, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Frame, Locator, Page, Response
@@ -155,7 +156,22 @@ class TealPage:
         # the one clicked); corrected automatically if Teal behaves differently.
         self.date_shift_days = DATE_CLICK_SHIFT_DAYS
         self._responses: list[Response] = []
+        self._attach(page)
+
+    def _attach(self, page: Page) -> None:
+        self.page = page
         page.on("response", self._on_response)
+
+    def ensure_page(self) -> None:
+        """If the Teal tab was closed (by hand, or moved into the installed Teal
+        app's window), carry on in another Teal tab or a new one."""
+        if not self.page.is_closed():
+            return
+        context = self.page.context
+        host = urlsplit(self.tracker_url).netloc
+        open_teal = [p for p in context.pages
+                     if not p.is_closed() and urlsplit(p.url).netloc == host]
+        self._attach(open_teal[-1] if open_teal else context.new_page())
 
     # -- Teal's own data, as the page receives it ---------------------------
 
@@ -189,6 +205,7 @@ class TealPage:
 
     def open_tracker(self, reload: bool = False) -> None:
         """Make sure the contact tracker is showing with its Add button."""
+        self.ensure_page()
         try:
             if reload or self.page.url.split("?")[0].rstrip("/") != self.tracker_url:
                 self.page.goto(self.tracker_url, wait_until="domcontentloaded",
@@ -416,6 +433,7 @@ class TealPage:
     # -- a contact's page -------------------------------------------------------
 
     def open_record(self, ident: str, reload: bool = False) -> None:
+        self.ensure_page()
         try:
             if reload or self.current_id() != ident:
                 self.page.goto(f"{self.tracker_url}/{ident}", wait_until="domcontentloaded",
@@ -686,6 +704,8 @@ class TealPage:
         self.page.wait_for_timeout(ms)
 
     def screenshot(self, path: Path) -> Path | None:
+        if self.page.is_closed():
+            return None
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             self.page.screenshot(path=str(path), timeout=10_000)

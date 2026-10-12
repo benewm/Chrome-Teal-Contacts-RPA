@@ -24,6 +24,8 @@ from .compare import CHOICE_FIELDS, DATE_FIELDS, FORM_FIELDS, Mismatch, compare,
 from .linkedin import ContactInfo, LinkedInError, LinkedInLoginRequired, LinkedInPage
 from .spreadsheet import Contact, Sheet, SpreadsheetLockedError, ensure_columns, write_back
 from .state import DONE, FAILED, NEEDS_ATTENTION, SKIPPED, RunState
+from playwright.sync_api import Error as PlaywrightError
+
 from .teal import NotAnOption, NotLoggedIn, SaveUnconfirmed, TealError, TealPage
 
 log = logging.getLogger("teal_rpa")
@@ -190,6 +192,8 @@ class Run:
     # -- pass 1: LinkedIn -----------------------------------------------------
 
     def needs_lookup(self, contact: Contact) -> bool:
+        if contact.teal_id:  # already in Teal, so LinkedIn was checked before
+            return False
         missing = [f for f in ASKABLE_FIELDS if not self.contact_value(contact, f)]
         return bool(missing) and not self.state.recall(contact.key, "enriched")
 
@@ -206,6 +210,12 @@ class Run:
             except UserQuit:
                 say("  Stopping.")
                 return False
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:  # one contact's problem never stops the run
+                log.exception("Row %s: LinkedIn pass failed", contact.row_number)
+                say(f"    LinkedIn: unexpected error, skipping this one for now ({_short(exc)}).")
+                looked = True
             if looked and index < len(todo) and self.options.linkedin_delay > 0:
                 self.sleep(random.uniform(self.options.linkedin_delay, self.options.linkedin_delay * 1.5))
         return True
@@ -235,6 +245,9 @@ class Run:
             elif not (info.emails or info.phones):
                 say(f"    LinkedIn: {info.note or 'nothing found'}")
                 self.save_linkedin_evidence(contact, info)
+            else:
+                still = [ASKABLE_FIELDS[f].lower() for f in ASKABLE_FIELDS if not values[f]]
+                say("    LinkedIn: nothing new" + (f" (no {' or '.join(still)} shared)" if still else ""))
 
         typed: dict[str, str] = {}
         if not values["email"] and not values["phone"]:
@@ -284,7 +297,8 @@ class Run:
         except Exception as exc:  # evidence is best effort
             log.warning("Row %s: couldn't save LinkedIn evidence: %s", contact.row_number, exc)
         finally:
-            self.teal.page.bring_to_front()
+            if not self.teal.page.is_closed():
+                self.teal.page.bring_to_front()
 
     # -- pass 2: Teal ---------------------------------------------------------
 
@@ -303,6 +317,7 @@ class Run:
 
     def load_all(self, contacts: list[Contact]) -> None:
         """Pass 2."""
+        self.teal.ensure_page()
         self.teal.page.bring_to_front()
         try:
             if not self.ensure_logged_in():
@@ -339,6 +354,9 @@ class Run:
                 say("\nStopped (Ctrl+C).")
                 self.summary.not_reached += total - index + 1
                 return
+            except Exception as exc:  # one contact's problem never stops the run
+                log.exception("Row %s: unexpected error", contact.row_number)
+                outcome = self._fail(contact, f"Unexpected error: {_short(exc)}")
 
             if outcome.status == "quit":
                 say("  Stopping; this contact stays pending.")
@@ -447,8 +465,8 @@ class Run:
             teal_id = self.teal.create(frame, contact.first_name, contact.last_name, contact.url)
         except SaveUnconfirmed as exc:
             return self._fail(contact, f"{exc}. It may have been saved - check Teal before re-running.")
-        except TealError as exc:
-            return self._fail(contact, f"Saved, but then: {exc}. Check Teal before re-running.")
+        except (TealError, PlaywrightError) as exc:
+            return self._fail(contact, f"Saved, but then: {_short(exc)}. Check Teal before re-running.")
         if not teal_id:
             return self._fail(contact, "Saved, but couldn't find the new contact in Teal's list "
                                        "to get its ID. Check Teal, then put its ID in the "
@@ -505,7 +523,9 @@ class Run:
                 return action()
             except NotLoggedIn:
                 raise
-            except TealError as exc:
+            except (TealError, PlaywrightError) as exc:
+                # PlaywrightError: e.g. the Teal tab was closed; the next try reopens it.
+                exc = TealError(_short(exc)) if isinstance(exc, PlaywrightError) else exc
                 log.warning("Row %s attempt %s/%s: %s", contact.row_number, attempt, attempts, exc)
                 if attempt == attempts:
                     return self._fail(contact, str(exc))
@@ -519,6 +539,11 @@ class Run:
     def _fail(self, contact: Contact, reason: str) -> Outcome:
         shot = self._screenshot(contact)
         return Outcome(FAILED, f"{reason} [screenshot: {shot}]" if shot else reason)
+
+
+def _short(exc: Exception) -> str:
+    text = str(exc).strip()
+    return text.splitlines()[0][:200] if text else type(exc).__name__
 
 
 def setup_logging(log_dir: Path) -> Path:

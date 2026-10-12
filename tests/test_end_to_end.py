@@ -469,6 +469,47 @@ def test_dates_still_right_if_teal_fixes_its_date_bug(tmp_path, sites, page):
 
 # -- things that don't work out -------------------------------------------------
 
+def test_closed_teal_tab_is_reopened(tmp_path, sites, page, monkeypatch):
+    run = make_run(tmp_path, sites, page, [
+        row("Ed", "Soo Hoo", "edsoohoo", email="ed@x.com", phone="1", goal="Networking"),
+        row("Pri", "Vate", "private", email="p@x.com", phone="2", status="To be contacted"),
+    ], linkedin=False)
+    original = run.teal.open_form
+    closed = []
+
+    def close_tab_once():
+        if not closed:  # e.g. Chrome moved the tab into the Teal app window
+            closed.append(1)
+            run.teal.page.close()
+        return original()
+
+    monkeypatch.setattr(run.teal, "open_form", close_tab_once)
+
+    summary = run_both(run)
+
+    assert [c.name for c in summary.done] == ["Ed Soo Hoo", "Pri Vate"]
+    assert len(sites.contacts) == 2 and run.teal.page is not page
+
+
+def test_unexpected_error_fails_one_contact_not_the_run(tmp_path, sites, page, monkeypatch):
+    run = make_run(tmp_path, sites, page, [
+        row("Ed", "Soo Hoo", "edsoohoo", email="ed@x.com", phone="1"),
+        row("Pri", "Vate", "private", email="p@x.com", phone="2"),
+    ], linkedin=False)
+    original = run.process_contact
+
+    def boom_for_ed(contact):
+        if contact.first_name == "Ed":
+            raise RuntimeError("something odd")
+        return original(contact)
+
+    monkeypatch.setattr(run, "process_contact", boom_for_ed)
+
+    summary = run_both(run)
+
+    assert [c.name for c in summary.done] == ["Pri Vate"]
+    assert "Unexpected error: something odd" in summary.failed[0][1]
+
 def test_calendar_problem_keeps_its_html(tmp_path, sites, page):
     sites.config = {"disabledDays": True}
     run = make_run(tmp_path, sites, page, [

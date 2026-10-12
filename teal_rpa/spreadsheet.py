@@ -68,6 +68,7 @@ class Contact:
     follow_up: str = ""       # ISO date (YYYY-MM-DD) or ""
     last_contacted: str = ""  # ISO date (YYYY-MM-DD) or ""
     teal_id: str = ""
+    rpa_status: str = ""      # the tool's own result column, from an earlier run
     raw: dict[str, str] = field(default_factory=dict)
     problems: list[str] = field(default_factory=list)  # row can't be processed
     warnings: list[str] = field(default_factory=list)  # processed, but worth a look
@@ -267,6 +268,7 @@ def load_contacts(path: str | Path, sheet_name: str | None = None) -> Sheet:
             location=get("location"),
             twitter=get("twitter"),
             teal_id=get("teal_id"),
+            rpa_status=get("rpa_status"),
             raw=raw,
         )
         for name in CHOICE_FIELDS:
@@ -296,8 +298,10 @@ def load_contacts(path: str | Path, sheet_name: str | None = None) -> Sheet:
     return Sheet(path, actual_sheet, headers, column_map, contacts, warnings)
 
 
-def _with_lock_retry(action, path: Path, attempts: int = 4, wait: float = 1.5):
-    # OneDrive and Excel hold the file briefly while syncing/saving.
+def _with_lock_retry(action, path: Path, attempts: int = 8):
+    # OneDrive and Excel hold the file briefly while syncing/saving: wait and retry
+    # (0.5s, 1s, 2s, 3s... about 20 seconds in all).
+    wait = 0.5
     for attempt in range(attempts):
         try:
             return action()
@@ -308,6 +312,7 @@ def _with_lock_retry(action, path: Path, attempts: int = 4, wait: float = 1.5):
                     "Close it and re-run."
                 ) from exc
             time.sleep(wait)
+            wait = min(wait * 2, 3.0)
 
 
 def ensure_columns(sheet: Sheet, fields: list[str]) -> list[str]:

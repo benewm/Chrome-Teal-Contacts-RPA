@@ -170,9 +170,15 @@ point; a re-run carries on where it left off.
 
 ### What it creates next to your spreadsheet
 
-- `Upload 1.xlsx.status.json`: progress per contact (status, reason, Teal ID,
-  email/phone found, whether LinkedIn was already checked). Re-runs skip `done`
-  contacts and retry the rest. Delete it, or use `--reset`, to start over.
+- Logs and failure screenshots (below). The **progress file** is *not* next to the
+  spreadsheet: it lives on this PC in
+  `%LOCALAPPDATA%\TealContactsRPA\progress\<sheet name>-<id>.status.json`
+  (`--check` prints the exact path). It's rewritten after every step, and keeping it
+  out of OneDrive avoids OneDrive locking it mid-run. It holds each contact's status,
+  reason, Teal ID, email/phone found and whether LinkedIn was already checked.
+  Re-runs skip `done` contacts (per the progress file *or* the sheet's `rpa_status`
+  column) and retry the rest. `--reset` clears it. An older progress file next to
+  the spreadsheet is picked up automatically (and renamed `.status.json.moved`).
 - `logs\teal_contacts-<date>-<time>.log`: everything each run did.
 - `failures\row-<N>.png`: a screenshot of Chrome when a row fails or needs attention.
 - `failures\linkedin-row-<N>.txt` / `.png`: what LinkedIn showed when no email or
@@ -265,7 +271,18 @@ may or may not have been created, so check Teal before re-running that row; fix
 the spreadsheet cell, then re-run (failed rows are retried automatically).
 
 **"Can't write to Upload 1.xlsx - is it open in Excel (or still syncing)?"**: close
-it in Excel. The values are kept in the `.status.json` file and written on the next run.
+it in Excel. The tool already waits about 20 seconds for OneDrive to let go of the
+file; if it still can't write, the values are kept in the progress file and written
+on the next run. If this happens a lot, pause OneDrive syncing while the tool runs
+(OneDrive icon > Settings > Pause syncing), or keep the working copy of the
+spreadsheet outside OneDrive.
+
+**"Target page, context or browser has been closed"**: the Teal tab the tool was
+using disappeared (closed by hand, or Chrome moved it into the installed **Teal
+app** window). The tool now carries on in another Teal tab or opens a new one, so
+this should only cost a retry. If it keeps happening, stop Chrome from opening Teal
+links in the app: in the tool's Chrome window go to `chrome://apps`, right-click
+Teal and turn off **Open as window**, or uninstall the app from that profile.
 
 **"needs attention: Status: Teal shows ..., sheet has ..."**: the tool set the field
 but Teal shows something else after reloading. Fix it in Teal (or the sheet) and

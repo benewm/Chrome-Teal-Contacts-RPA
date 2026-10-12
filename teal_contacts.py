@@ -84,13 +84,13 @@ def list_pending(sheet: Sheet, state: RunState, invalid: list[Contact], linkedin
     valid = [c for c in sheet.contacts if c.is_valid]
     counts = state.counts(c.key for c in valid)
     where = f" (sheet '{sheet.sheet_name}')" if sheet.sheet_name else ""
-    print(f"{sheet.path.name}{where}: {len(sheet.contacts)} contacts")
+    print(f"{sheet.path.name}{where}: {len(sheet.contacts)} contacts  (progress file: {state.path})")
     print("  " + "   ".join(f"{name}: {count}" for name, count in counts.items())
           + f"   can't process: {len(invalid)}")
     for c in invalid:
         print(f"  ! row {c.row_number} {c.name}: {'; '.join(c.problems)}")
     for c in valid:
-        if state.is_done(c.key):
+        if state.is_done(c.key) or c.rpa_status.casefold() == DONE:
             continue
         notes = []
         status = state.status(c.key)
@@ -144,7 +144,8 @@ def main(argv=None) -> int:
         return 0
 
     valid = [c for c in sheet.contacts if c.is_valid]
-    todo = [c for c in valid if not state.is_done(c.key)]
+    # Done according to the progress file, or to the sheet's rpa_status column.
+    todo = [c for c in valid if not state.is_done(c.key) and c.rpa_status.casefold() != DONE]
     already_done = len(valid) - len(todo)
     if args.limit:
         todo = todo[: args.limit]

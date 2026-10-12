@@ -24,13 +24,8 @@ DEFAULT_PORT = 9333
 
 
 def default_profile_dir() -> Path:
-    if sys.platform == "win32":
-        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-    elif sys.platform == "darwin":
-        base = Path.home() / "Library" / "Application Support"
-    else:
-        base = Path.home() / ".local" / "share"
-    return base / "TealContactsRPA" / "chrome-profile"
+    from .state import app_data_dir
+    return app_data_dir() / "chrome-profile"
 
 
 class BrowserError(Exception):
